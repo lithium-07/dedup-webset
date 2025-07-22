@@ -1,8 +1,10 @@
 // backend/dedup/dedupService.js
-import { fromUrl }            from 'tldts';
+import pkg                    from 'tldts';
 import natural                from 'natural';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import Bottleneck             from 'bottleneck';
+
+const { fromUrl } = pkg;
 
 const GENERIC_SUBS = new Set(['', 'www', 'api', 'app', 'blog', 'docs']);
 const JARO_THRESH  = 0.90;
