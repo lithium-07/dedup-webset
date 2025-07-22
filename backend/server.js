@@ -56,8 +56,8 @@ app.post('/api/websets', async (req, res) => {
             id: webset.id,
             status: 'processing',
             items: [],
-            clients: new Map(),
-            dedup: new DedupService((wid, msg) => broadcastToClients(wid, msg))
+            // clients: new Map(),
+            // dedup: new DedupService((wid, msg) => broadcastToClients(wid, msg))
         });
 
         res.json({ websetId: webset.id });
