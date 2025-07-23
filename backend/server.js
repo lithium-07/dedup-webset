@@ -33,12 +33,19 @@ const activeWebsets = new Map();
 // Create webset endpoint
 app.post('/api/websets', async (req, res) => {
     try {
-        const { query, count = 10, enrichments = [] } = req.body;
+        const { query, count = 10, entity, enrichments = [] } = req.body;
 
         const websetParams = {
-            search: {
+            search: entity ? {
                 query,
-                count: parseInt(count)
+                count: parseInt(count),
+                entity: {
+                    type: "custom",
+                    description: entity
+                }
+            }: {
+                query,
+                count: parseInt(count),
             }
         };
 
@@ -51,13 +58,17 @@ app.post('/api/websets', async (req, res) => {
 
         const webset = await exa.websets.create(websetParams);
         
+        // Check if dedup is enabled via environment variable
+        const dedupEnabled = process.env.ENABLE_DEDUP === 'true';
+        console.log(`🔧 CONFIG: Deduplication ${dedupEnabled ? 'ENABLED' : 'DISABLED'}`);
+
         // Store the webset for streaming
         activeWebsets.set(webset.id, {
             id: webset.id,
             status: 'processing',
             items: [],
-            // clients: new Map(),
-            // dedup: new DedupService((wid, msg) => broadcastToClients(wid, msg))
+            clients: new Map(),
+            dedup: dedupEnabled ? new DedupService((wid, msg) => broadcastToClients(wid, msg)) : null
         });
 
         res.json({ websetId: webset.id });
@@ -118,7 +129,7 @@ async function pollWebsetResults(websetId) {
         
         // Use Exa's waitUntilIdle with custom polling
         await exa.websets.waitUntilIdle(websetId, {
-            timeout: 300000, // 5 minutes
+            timeout: 3000000, // 50 minutes
             pollInterval: 3000, // 3 seconds
             onPoll: async (status) => {
                 console.log(`Webset ${websetId} status: ${status}`);
@@ -140,9 +151,21 @@ async function pollWebsetResults(websetId) {
                         // Add new items and broadcast them
                         const dedup = websetData.dedup;
 
+                        console.log(`📦 SERVER: Processing ${newItems.length} new items for webset ${websetId}`);
                         for (const item of newItems) {
+                            console.log(`📦 SERVER: Adding item ${item.id} (${item.name || item.title || 'no name'}) to webset`);
                             websetData.items.push(item);
-                            await dedup.ingest(websetId, item);
+                            
+                            if (dedup) {
+                                // Dedup service handles its own broadcasting via callback
+                                const dedupStart = Date.now();
+                                await dedup.ingest(websetId, item);
+                                console.log(`📦 SERVER: Dedup processing completed for ${item.id} (${Date.now() - dedupStart}ms)`);
+                            } else {
+                                // No dedup - broadcast directly
+                                console.log(`📦 SERVER: No dedup - broadcasting ${item.id} directly`);
+                                broadcastToClients(websetId, { type: 'item', item });
+                            }
                         }
                     }
                 } catch (itemsError) {
@@ -167,14 +190,32 @@ async function pollWebsetResults(websetId) {
 
 // Broadcast message to all clients listening to a webset
 function broadcastToClients(websetId, message) {
+    console.log(`📡 BROADCAST: Sending ${message.type} to ${websetId}`, {
+        type: message.type,
+        hasItem: !!message.item,
+        itemName: message.item?.name || message.item?.title,
+        tmpId: message.tmpId,
+        status: message.status,
+        error: message.error
+    });
+    
     const websetData = activeWebsets.get(websetId);
     if (websetData && websetData.clients) {
-        websetData.clients.forEach(res => {
+        const clientCount = websetData.clients.size;
+        console.log(`📡 BROADCAST: Found ${clientCount} clients for webset ${websetId}`);
+        
+        websetData.clients.forEach((res, clientId) => {
             try {
                 res.write(`data: ${JSON.stringify(message)}\n\n`);
+                console.log(`📡 BROADCAST: Sent to client ${clientId}`);
             } catch (error) {
-                console.error('Error writing to client:', error);
+                console.error(`📡 BROADCAST: Error writing to client ${clientId}:`, error);
             }
+        });
+    } else {
+        console.log(`📡 BROADCAST: No clients found for webset ${websetId}`, { 
+            hasWebsetData: !!websetData, 
+            hasClients: !!(websetData?.clients) 
         });
     }
 }

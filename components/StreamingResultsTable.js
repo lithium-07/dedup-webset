@@ -4,6 +4,8 @@ import styles from './StreamingResultsTable.module.css';
 
 export default function StreamingResultsTable({ websetId }) {
   const [items, setItems] = useState([]);
+  const [rejectedItems, setRejectedItems] = useState([]);
+  const [showRejected, setShowRejected] = useState(false);
   const [status, setStatus] = useState('connecting');
   const [error, setError] = useState(null);
   const [columns, setColumns] = useState([]);
@@ -19,6 +21,7 @@ export default function StreamingResultsTable({ websetId }) {
     setStatus('processing');
     setError(null);
     setItems([]);
+    setRejectedItems([]);
     setColumns([]);
     setSortConfig({ key: null, direction: null });
 
@@ -76,6 +79,65 @@ export default function StreamingResultsTable({ websetId }) {
             setError(data.error);
             setStatus('error');
             enqueueSnackbar(`Stream error: ${data.error}`, { variant: 'error' });
+            break;
+
+          case 'pending':
+            // Item is temporarily added but pending LLM verification
+            console.log('Pending item with tmpId:', data.tmpId);
+            setItems(prev => {
+              // Add item with pending status
+              const pendingItem = { 
+                id: data.tmpId, 
+                _pending: true,
+                properties: { status: { value: 'Checking for duplicates...' } }
+              };
+              const newItems = [...prev, pendingItem];
+              updateColumns(newItems);
+              return newItems;
+            });
+            enqueueSnackbar('Checking item for duplicates...', { variant: 'info' });
+            break;
+
+          case 'drop':
+            // Remove item that was determined to be duplicate
+            console.log('Dropping item with tmpId:', data.tmpId);
+            setItems(prev => {
+              const filtered = prev.filter(item => item.id !== data.tmpId);
+              updateColumns(filtered);
+              return filtered;
+            });
+            enqueueSnackbar('Duplicate item removed', { variant: 'warning' });
+            break;
+
+          case 'confirm':
+            // Replace pending item with confirmed data
+            console.log('Confirming item:', JSON.stringify(data.data, null, 2));
+            setItems(prev => {
+              const updated = prev.map(item => 
+                item._pending && item.id === data.data.id 
+                  ? { ...data.data, _confirmed: true }
+                  : item
+              );
+              updateColumns(updated);
+              return updated;
+            });
+            enqueueSnackbar('Item confirmed as unique', { variant: 'success' });
+            break;
+
+          case 'rejected':
+            // Add rejected item to rejected items list
+            console.log('Item rejected:', JSON.stringify(data.item, null, 2));
+            setRejectedItems(prev => {
+              const rejectedItem = {
+                ...data.item,
+                _rejectionReason: data.reason,
+                _rejectionDetails: data.details,
+                _existingItem: data.existingItem,
+                _rejectedAt: new Date().toISOString()
+              };
+              return [...prev, rejectedItem];
+            });
+            enqueueSnackbar(`Item rejected: ${data.details}`, { variant: 'warning' });
             break;
         }
               } catch (err) {
@@ -399,7 +461,22 @@ export default function StreamingResultsTable({ websetId }) {
         </div>
         <div className={styles.itemCount}>
           Items received: {items.length}
+          {rejectedItems.length > 0 && (
+            <span className={styles.rejectedCount}>
+              • Rejected: {rejectedItems.length}
+            </span>
+          )}
         </div>
+        {rejectedItems.length > 0 && (
+          <div className={styles.rejectedToggle}>
+            <button 
+              onClick={() => setShowRejected(!showRejected)}
+              className={styles.toggleButton}
+            >
+              {showRejected ? 'Hide' : 'Show'} Rejected ({rejectedItems.length})
+            </button>
+          </div>
+        )}
       </div>
 
       {error && (
@@ -488,8 +565,19 @@ export default function StreamingResultsTable({ websetId }) {
                   properties: item.properties
                 });
                 
+                // Determine row CSS classes based on item status
+                const getRowClassName = () => {
+                  let className = styles.itemRow;
+                  if (item._pending) {
+                    className += ` ${styles.pendingRow}`;
+                  } else if (item._confirmed) {
+                    className += ` ${styles.confirmedRow}`;
+                  }
+                  return className;
+                };
+                
                 return (
-                  <tr key={item.id || index} className={styles.itemRow}>
+                  <tr key={item.id || index} className={getRowClassName()}>
                     {columns.map(column => {
                       let cellValue;
                       
@@ -531,6 +619,73 @@ export default function StreamingResultsTable({ websetId }) {
               })}
             </tbody>
           </table>
+        </div>
+      )}
+      
+      {/* Rejected Items Section */}
+      {showRejected && rejectedItems.length > 0 && (
+        <div className={styles.rejectedSection}>
+          <h3 className={styles.rejectedTitle}>
+            🚫 Rejected Items ({rejectedItems.length})
+          </h3>
+          <div className={styles.tableContainer}>
+            <table className={styles.table}>
+              <thead>
+                <tr>
+                  <th>Rejection Reason</th>
+                  <th>Item Name</th>
+                  <th>URL</th>
+                  <th>Details</th>
+                  <th>Rejected At</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rejectedItems.map((item, index) => {
+                  const reasonLabels = {
+                    'exact_match': 'Exact Match',
+                    'fuzzy_match': 'Similar Name',
+                    'cache_hit': 'Previously Seen',
+                    'llm_duplicate': 'AI Detected Duplicate',
+                    'near_duplicate': 'Vector Similarity'
+                  };
+                  
+                  const reasonIcons = {
+                    'exact_match': '🎯',
+                    'fuzzy_match': '📊',
+                    'cache_hit': '💾',
+                    'llm_duplicate': '🤖',
+                    'near_duplicate': '🔍'
+                  };
+                  
+                  return (
+                    <tr key={`rejected-${index}`} className={styles.rejectedRow}>
+                      <td className={styles.reasonCell}>
+                        {reasonIcons[item._rejectionReason]} {reasonLabels[item._rejectionReason]}
+                      </td>
+                      <td>
+                        {item.properties?.company?.name || item.name || item.title || 'No name'}
+                      </td>
+                      <td className={styles.urlCell}>
+                        {item.properties?.url ? (
+                          <a href={item.properties.url} target="_blank" rel="noopener noreferrer">
+                            {item.properties.url.replace('https://', '').substring(0, 30)}...
+                          </a>
+                        ) : (
+                          'No URL'
+                        )}
+                      </td>
+                      <td className={styles.detailsCell}>
+                        {item._rejectionDetails}
+                      </td>
+                      <td className={styles.timeCell}>
+                        {new Date(item._rejectedAt).toLocaleTimeString()}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
         </div>
       )}
     </div>

@@ -7,6 +7,7 @@ A Next.js frontend with Express backend that demonstrates real-time streaming of
 - 🔍 **Interactive Query Interface**: Create websets with custom search queries and enrichments
 - 📊 **Real-time Streaming Table**: Watch results populate in real-time as they're processed by Exa
 - 🎯 **Enrichments Support**: Add custom enrichments to extract specific data from results
+- 🧠 **Smart Deduplication**: Optional AI-powered duplicate detection with rejected items transparency
 - 📱 **Responsive Design**: Works seamlessly on desktop and mobile devices
 - ⚡ **Server-Sent Events**: Efficient real-time updates without polling
 
@@ -32,9 +33,21 @@ A Next.js frontend with Express backend that demonstrates real-time streaming of
 2. **Create `.env` file** in the root directory:
    ```bash
    EXA_API_KEY=your_exa_api_key_here
+   GOOGLE_API_KEY=your_google_ai_api_key_here  # Required for deduplication
+   PORT=3000
+   ENABLE_DEDUP=false  # Set to 'true' to enable intelligent deduplication
+   VECTOR_URL=http://localhost:7000  # Optional: Vector service URL
    ```
 
-3. **Start the application**:
+3. **Setup Vector Service** (required for deduplication):
+   ```bash
+   cd vector-service
+   pip install -r requirements.txt
+   python app.py &  # Runs on port 7000
+   cd ..
+   ```
+
+4. **Start the application**:
    ```bash
    npm run dev
    ```
@@ -56,6 +69,35 @@ A Next.js frontend with Express backend that demonstrates real-time streaming of
    - The table will populate in real-time as Exa processes your webset
    - Status indicator shows current processing state
    - New rows appear with smooth animations as results arrive
+
+## 🧠 Intelligent Deduplication (Optional)
+
+Set `ENABLE_DEDUP=true` in your `.env` file to activate AI-powered duplicate detection:
+
+### How It Works:
+- **Tier 0**: Exact domain/brand matches → instant rejection
+- **Tier 1**: Fuzzy name matching (90% Jaro-Winkler threshold) → instant rejection  
+- **Tier 2**: Ambiguous cases → Google Gemini LLM verification
+
+### Visual Feedback:
+- 🔄 **Pending**: Yellow background with spinner (LLM verification in progress)
+- ✅ **Confirmed**: Blue background with checkmark (confirmed unique)
+- ❌ **Rejected**: Items filtered out are collected in a separate "Rejected Items" view
+- 🚫 **Rejected Items View**: Toggle to show/hide filtered items with detailed rejection reasons
+
+### Rejected Items Tracking:
+- 🎯 **Exact Match**: Same domain/brand combination
+- 📊 **Similar Name**: High fuzzy matching score (>95% similarity)  
+- 💾 **Previously Seen**: Cached LLM decision from earlier comparison
+- 🤖 **AI Detected Duplicate**: Google Gemini determined items are duplicates
+- 🔍 **Vector Similarity**: Semantic similarity detected via embeddings (FAISS + Sentence Transformers)
+
+### Performance:
+- Items process in <20ms for clear cases
+- LLM batching (25 items, 300ms timeout) for ambiguous cases
+- Real-time status updates via Server-Sent Events
+
+**Note**: Requires `GOOGLE_API_KEY` for LLM verification. Disable if you want all results without filtering.
 
 ## API Endpoints
 

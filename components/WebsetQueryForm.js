@@ -3,6 +3,7 @@ import styles from './WebsetQueryForm.module.css';
 
 export default function WebsetQueryForm({ onSubmit, isLoading }) {
   const [query, setQuery] = useState('');
+  const [entity, setEntity] = useState('');
   const [count, setCount] = useState(10);
   const [enrichments, setEnrichments] = useState([
     { description: 'Extract key contact information', format: 'text' }
@@ -14,6 +15,7 @@ export default function WebsetQueryForm({ onSubmit, isLoading }) {
 
     onSubmit({
       query: query.trim(),
+      entity: entity.trim(),
       count,
       enrichments: enrichments.filter(e => e.description.trim())
     });
@@ -51,6 +53,18 @@ export default function WebsetQueryForm({ onSubmit, isLoading }) {
         </div>
 
         <div className={styles.field}>
+          <label htmlFor="entity">Entity</label>
+          <input
+            type="text"
+            id="entity"
+            value={entity}
+            onChange={(e) => setEntity(e.target.value)}
+            placeholder="e.g., movies, anime_series, etc. (optional)"
+            className={styles.input}
+          />
+        </div>
+
+        <div className={styles.field}>
           <label htmlFor="count">Number of Results</label>
           <input
             type="number"
@@ -58,7 +72,7 @@ export default function WebsetQueryForm({ onSubmit, isLoading }) {
             value={count}
             onChange={(e) => setCount(parseInt(e.target.value) || 1)}
             min="1"
-            max="100"
+            max="1000"
             className={styles.input}
           />
         </div>

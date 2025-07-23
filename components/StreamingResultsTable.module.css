@@ -500,4 +500,123 @@
     font-weight: 600;
     color: #374151;
   }
-} 
+}
+
+/* Deduplication styles */
+.pendingRow {
+  background-color: #fffbeb;
+  border-left: 3px solid #f59e0b;
+  opacity: 0.7;
+  position: relative;
+}
+
+.pendingRow::before {
+  content: "🔄";
+  position: absolute;
+  left: 0.5rem;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 1rem;
+  animation: spin 2s linear infinite;
+}
+
+.confirmedRow {
+  background-color: #f0f9ff;
+  border-left: 3px solid #10b981;
+}
+
+.confirmedRow::before {
+  content: "✓";
+  position: absolute;
+  left: 0.5rem;
+  top: 50%;
+  transform: translateY(-50%);
+  color: #10b981;
+  font-weight: bold;
+}
+
+@keyframes spin {
+  from { transform: translateY(-50%) rotate(0deg); }
+  to { transform: translateY(-50%) rotate(360deg); }
+}
+
+.dedupStatus {
+  font-size: 0.8rem;
+  color: #f59e0b;
+  font-style: italic;
+  font-weight: 500;
+}
+
+/* Rejected items section */
+.rejectedCount {
+  color: #ef4444;
+  font-weight: 600;
+  margin-left: 0.5rem;
+}
+
+.rejectedToggle {
+  display: flex;
+  align-items: center;
+}
+
+.toggleButton {
+  background: #ef4444;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  padding: 0.5rem 1rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.toggleButton:hover {
+  background: #dc2626;
+}
+
+.rejectedSection {
+  margin-top: 2rem;
+  padding: 1rem;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: 8px;
+}
+
+.rejectedTitle {
+  margin: 0 0 1rem 0;
+  color: #dc2626;
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
+.rejectedRow {
+  background: #fee2e2 !important;
+  opacity: 0.8;
+}
+
+.rejectedRow td {
+  vertical-align: top;
+  padding: 0.75rem 0.5rem;
+  border-bottom: 1px solid #fca5a5;
+}
+
+.reasonCell {
+  font-weight: 600;
+  color: #991b1b;
+  min-width: 140px;
+}
+
+.detailsCell {
+  font-style: italic;
+  color: #7f1d1d;
+  font-size: 0.9rem;
+  max-width: 200px;
+  word-wrap: break-word;
+}
+
+.timeCell {
+  font-size: 0.8rem;
+  color: #6b7280;
+  min-width: 80px;
+}
