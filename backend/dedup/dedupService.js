@@ -4,6 +4,7 @@ import natural                from 'natural';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import Bottleneck             from 'bottleneck';
 import { vecAdd, vecQuery } from './vectorClient.js';
+import fetch from 'node-fetch'; // For URL resolution
 
 
 const { parse: fromUrl } = tldts;
@@ -268,6 +269,34 @@ export class DedupService {
       }
       
       console.log(`🔍 DEDUP: Raw candidate pool: ${candidatePool.length} entities`);
+      
+      // IMPROVEMENT 13A: URL resolution for high-similarity candidates (COMPANY flow only)
+      const urlResolutionEnabled = process.env.ENABLE_URL_RESOLUTION === 'true';
+      if (urlResolutionEnabled && !this.entityType) {
+        console.log(`🌐 DEDUP: URL resolution enabled for COMPANY flow - checking ${candidatePool.length} candidates`);
+        for (const candidate of candidatePool) {
+          if (candidate && candidate.name) {
+            const urlResolutionResult = await this._resolveUrlIfSuspicious(row, candidate);
+            if (urlResolutionResult === true) {
+              console.log(`❌ DEDUP: URL resolution confirms duplicate with ${candidate.name} - REJECTING`);
+            this._broadcastRejection(
+              websetId,
+              row.raw,
+              'url_resolution_duplicate',
+              `URL resolution confirms duplicate of: ${candidate.name}`,
+              candidate.raw
+            );
+              return;
+            }
+          }
+        }
+      } else {
+        if (this.entityType) {
+          console.log(`🌐 DEDUP: URL resolution skipped for ENTITY flow (entities have bulletproof name matching)`);
+        } else if (!urlResolutionEnabled) {
+          console.log(`🌐 DEDUP: URL resolution disabled for COMPANY flow (set ENABLE_URL_RESOLUTION=true to enable)`);
+        }
+      }
       
       // Smart filtering: Calculate name similarity scores and keep only high-quality matches
       const highQualityCandidates = candidatePool
@@ -1104,6 +1133,164 @@ ${JSON.stringify({
       details: details,
       existingItem: existingItem
     });
+  }
+
+  // IMPROVEMENT 13: Strategic URL resolution for suspicious cases (optional)
+  // Only for NON-ENTITY flow - entities have bulletproof name matching already
+  async _resolveUrlIfSuspicious(itemA, itemB) {
+    // Only enable for company/non-entity flow
+    if (this.entityType) {
+      return null; // Entities have bulletproof name matching, don't need URL resolution
+    }
+    
+    // Check if URL resolution is enabled
+    const urlResolutionEnabled = process.env.ENABLE_URL_RESOLUTION === 'true';
+    if (!urlResolutionEnabled) {
+      return null; // Feature disabled
+    }
+    
+    // Only resolve URLs in very specific cases to avoid performance issues
+    if (!this._shouldCheckUrlResolution(itemA, itemB)) {
+      return null;
+    }
+    
+    try {
+      // Use a cache to avoid hitting the same URL twice
+      const resolvedA = await this._getCachedUrlResolution(itemA.url);
+      const resolvedB = await this._getCachedUrlResolution(itemB.url);
+      
+      // If resolved URLs are the same, it's definitely a duplicate
+      if (resolvedA && resolvedB && resolvedA === resolvedB) {
+        console.log(`🌐 DEDUP: URL resolution confirms duplicate: ${resolvedA}`);
+        return true;
+      }
+      
+      return false;
+    } catch (error) {
+      console.warn(`⚠️ DEDUP: URL resolution failed, continuing with name-based logic:`, error);
+      return null; // Fall back to existing logic
+    }
+  }
+  
+  _shouldCheckUrlResolution(itemA, itemB) {
+    // Only check URLs for COMPANY items if:
+    // 1. Names are very similar (>90% match)
+    // 2. But URLs have different domains
+    // 3. And from known duplicate-prone domains
+    // Note: Not used for entities - they have bulletproof name matching
+    
+    const nameSimilarity = natural.JaroWinklerDistance(
+      this._normalizeEntityTitle(itemA.name || ''),
+      this._normalizeEntityTitle(itemB.name || '')
+    );
+    
+    if (nameSimilarity < 0.9) return false;
+    
+    const domainA = this._extractDomain(itemA.url);
+    const domainB = this._extractDomain(itemB.url);
+    
+    if (domainA === domainB) return false; // Same domain, no need to check
+    
+    const DUPLICATE_PRONE_DOMAINS = new Set([
+      'imdb.com', 'themoviedb.org', 'rottentomatoes.com',
+      'myanimelist.net', 'anidb.net', 'animenewsnetwork.com',
+      'amazon.com', 'youtube.com', 'wikipedia.org'
+    ]);
+    
+    return DUPLICATE_PRONE_DOMAINS.has(domainA) || DUPLICATE_PRONE_DOMAINS.has(domainB);
+  }
+  
+  async _getCachedUrlResolution(url) {
+    // Global cache across ALL DedupService instances - each URL resolved only once ever
+    if (!globalThis.urlResolutionCache) {
+      globalThis.urlResolutionCache = new Map();
+      globalThis.urlResolutionStats = { hits: 0, misses: 0, errors: 0 };
+    }
+    
+    if (globalThis.urlResolutionCache.has(url)) {
+      globalThis.urlResolutionStats.hits++;
+      const cached = globalThis.urlResolutionCache.get(url);
+      console.log(`🎯 DEDUP: URL cache HIT for ${url} → ${cached} (${globalThis.urlResolutionStats.hits} hits)`);
+      return cached;
+    }
+    
+    globalThis.urlResolutionStats.misses++;
+    console.log(`🌐 DEDUP: Resolving URL ${url} (${globalThis.urlResolutionStats.misses} misses)`);
+    
+    try {
+      // Retry logic for reliability
+      let lastError;
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          const response = await fetch(url, {
+            method: 'HEAD', // Faster than GET - we only need final URL
+            timeout: 3000,
+            redirect: 'follow',
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (compatible; DeduplicationBot/1.0)'
+            }
+          });
+          
+          const resolvedUrl = response.url;
+          globalThis.urlResolutionCache.set(url, resolvedUrl);
+          
+          console.log(`✅ DEDUP: URL resolved ${url} → ${resolvedUrl}`);
+          
+          // Limit cache size to prevent memory issues
+          if (globalThis.urlResolutionCache.size > 2000) {
+            const firstKey = globalThis.urlResolutionCache.keys().next().value;
+            globalThis.urlResolutionCache.delete(firstKey);
+            console.log(`🧹 DEDUP: URL cache cleanup, size now ${globalThis.urlResolutionCache.size}`);
+          }
+          
+          return resolvedUrl;
+        } catch (error) {
+          lastError = error;
+          if (attempt === 1) {
+            console.warn(`⚠️ DEDUP: URL resolution attempt ${attempt} failed for ${url}, retrying...`);
+            await new Promise(resolve => setTimeout(resolve, 1000)); // 1s delay
+          }
+        }
+      }
+      
+      throw lastError;
+    } catch (error) {
+      globalThis.urlResolutionStats.errors++;
+      console.warn(`❌ DEDUP: URL resolution failed for ${url} after 2 attempts:`, error.message);
+      
+      // Cache failures to avoid repeated attempts (but with shorter TTL concept)
+      globalThis.urlResolutionCache.set(url, null);
+      return null;
+    }
+  }
+  
+  _extractDomain(url) {
+    if (!url) return '';
+    try {
+      return new URL(url).hostname.replace(/^www\./, '');
+    } catch {
+      return '';
+    }
+  }
+  
+  // Utility: Get URL resolution cache statistics
+  static getUrlResolutionStats() {
+    if (!globalThis.urlResolutionCache) {
+      return { cacheSize: 0, hits: 0, misses: 0, errors: 0, hitRate: 0 };
+    }
+    
+    const stats = globalThis.urlResolutionStats || { hits: 0, misses: 0, errors: 0 };
+    const total = stats.hits + stats.misses;
+    const hitRate = total > 0 ? (stats.hits / total * 100).toFixed(1) : 0;
+    
+    return {
+      cacheSize: globalThis.urlResolutionCache.size,
+      hits: stats.hits,
+      misses: stats.misses, 
+      errors: stats.errors,
+      hitRate: `${hitRate}%`,
+      totalRequests: total
+    };
   }
 
   // FIXED: Add cleanup method to prevent memory leaks

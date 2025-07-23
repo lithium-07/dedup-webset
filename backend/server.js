@@ -253,5 +253,25 @@ function broadcastToClients(websetId, message) {
     }
 }
 
+// URL resolution statistics endpoint
+app.get('/api/stats/url-resolution', (req, res) => {
+    try {
+        const stats = DedupService.getUrlResolutionStats();
+        const isEnabled = process.env.ENABLE_URL_RESOLUTION === 'true';
+        res.json({
+            success: true,
+            enabled: isEnabled,
+            stats,
+            description: isEnabled 
+                ? "URL resolution cache statistics - shows how many URLs were resolved vs cached"
+                : "URL resolution is disabled. Set ENABLE_URL_RESOLUTION=true to enable."
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 app.listen(PORT, () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`📊 URL Resolution Stats: http://localhost:${PORT}/api/stats/url-resolution`);
 }); 
