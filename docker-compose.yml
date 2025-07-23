@@ -1,0 +1,68 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:7.0
+    container_name: exa_dedupe_mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    environment:
+      MONGO_INITDB_DATABASE: exa_dedupe
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  chromadb:
+    image: chromadb/chroma:0.5.0
+    container_name: exa_dedupe_chroma
+    restart: unless-stopped
+    ports:
+      - "9000:8000"  # ChromaDB runs on 8000 internally
+    volumes:
+      - chromadb_data:/chroma/chroma
+    environment:
+      - CHROMA_SERVER_AUTH_CREDENTIALS_FILE=
+      - CHROMA_SERVER_AUTH_CREDENTIALS=
+      - CHROMA_SERVER_AUTH_PROVIDER=
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  semantic_search:
+    build:
+      context: ./semantic-service
+      dockerfile: Dockerfile
+    container_name: exa_dedupe_semantic
+    restart: unless-stopped
+    ports:
+      - "9001:9001"  # Our semantic search service
+    environment:
+      - CHROMA_HOST=chromadb
+      - CHROMA_PORT=8000
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+    depends_on:
+      - chromadb
+    volumes:
+      - semantic_data:/data
+
+volumes:
+  mongodb_data:
+    driver: local
+  chromadb_data:
+    driver: local
+  semantic_data:
+    driver: local
+
+# Usage:
+# docker-compose up -d mongodb    # Start MongoDB in background
+# docker-compose down             # Stop all services  
+# docker-compose logs mongodb     # View MongoDB logs 

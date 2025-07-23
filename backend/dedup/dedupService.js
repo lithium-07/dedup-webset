@@ -5,6 +5,8 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import Bottleneck             from 'bottleneck';
 import { vecAdd, vecQuery } from './vectorClient.js';
 import fetch from 'node-fetch'; // For URL resolution
+import Webset from '../models/Webset.js';
+import Item from '../models/Item.js';
 
 
 const { parse: fromUrl } = tldts;
@@ -28,7 +30,8 @@ const ORGANIZATIONAL_SUBS = new Set([
 ]);
 
 const JARO_THRESH  = 0.95; // Increased threshold - only reject very similar names  
-const ENTITY_JARO_THRESH = 0.85; // Lower threshold for entities with normalized titles
+const ENTITY_JARO_THRESH = 0.92; // Increased threshold for entities to avoid false positives
+const VIDEO_PLATFORMS = new Set(['youtube.com', 'vimeo.com', 'dailymotion.com']);
 const LLM_BATCH    = 25;
 const LLM_LAT_MS   = 300;
 
@@ -52,15 +55,35 @@ export class DedupService {
     this.isProcessing = false;
     this.processedTitles = new Map(); // Entity normalized titles -> item info
     this.processedUrls = new Set(); // Entity exact URLs
+    // Track processed items by ID to prevent duplicates
+    this.processedIds = new Set(); // Track all processed item IDs
   }
 
   // BULLETPROOF: Queue-based sequential processing for entities only
   async ingest(websetId, item) {
+    // Generate ID if missing
+    if (!item || (!item.id && !item.properties?.id)) {
+      const generatedItem = {
+        ...item,
+        id: `item_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`
+      };
+      console.log(`🔄 DEDUP: Generated ID for item:`, generatedItem.id);
+      item = generatedItem;
+    }
+
+    // Check if we've already processed this item
+    const itemId = item.id || item.properties?.id;
+    if (this.processedIds.has(itemId)) {
+      console.log(`⚠️ DEDUP: Item ${itemId} already processed, skipping`);
+      return;
+    }
+    this.processedIds.add(itemId);
+
     if (this.entityType) {
       // Entities: Use bulletproof sequential processing
       return new Promise((resolve, reject) => {
         // FIXED: Add safety checks
-        if (!item || !item.id) {
+        if (!item) {
           console.error('❌ DEDUP: Invalid item passed to ingest:', item);
           reject(new Error('Invalid item'));
           return;
@@ -90,12 +113,14 @@ export class DedupService {
           await this._processItemSequentially(websetId, item);
           resolve();
         } catch (error) {
-          console.error(`❌ DEDUP: Processing error for item ${item.id}:`, error);
+          console.error(`❌ DEDUP: Processing error for item ${item?.id || 'unknown'}:`, error);
           reject(error);
+          // Don't break the queue processing on individual item errors
         }
       }
+    } catch (error) {
+      console.error('❌ DEDUP: Fatal error in queue processing:', error);
     } finally {
-      // FIXED: Ensure isProcessing is always reset, even if unexpected error occurs
       this.isProcessing = false;
     }
   }
@@ -118,12 +143,12 @@ export class DedupService {
       name: row.name 
     });
 
-    // BULLETPROOF LAYERS: Only for entities, companies use original logic
+    // BULLETPROOF LAYERS: Only for entities
     if (this.entityType) {
       // BULLETPROOF LAYER 1: Exact URL duplicate check (fastest)
       if (row.url && this.processedUrls.has(row.url)) {
         console.log(`❌ DEDUP: BULLETPROOF Layer 1 - Exact URL duplicate: ${row.url}`);
-        this._broadcastRejection(
+        await this._broadcastRejection(
           websetId, 
           row.raw, 
           'exact_url_duplicate',
@@ -139,7 +164,7 @@ export class DedupService {
         if (normalizedTitle && this.processedTitles.has(normalizedTitle)) {
           const existing = this.processedTitles.get(normalizedTitle);
           console.log(`❌ DEDUP: BULLETPROOF Layer 2 - Normalized title duplicate: "${normalizedTitle}"`);
-          this._broadcastRejection(
+          await this._broadcastRejection(
             websetId,
             row.raw,
             'normalized_title_duplicate', 
@@ -154,31 +179,27 @@ export class DedupService {
     const key0 = `${row.brand}:${row.etld1}:${row.subCls}`;
     console.log(`🔍 DEDUP: Checking key0: ${key0}, table size: ${this.table.size}`);
     
-    if (this.table.has(key0)) {
-      // If entity is present, skip domain-based rejection and rely on name similarity
-      if (this.entityType) {
-        console.log(`🔍 DEDUP: Entity search (${this.entityType}) - skipping domain-based rejection, continuing to name similarity check`);
-        // Continue to Tier 1 instead of rejecting
-      } else {
-        console.log(`❌ DEDUP: Tier 0 exact match found - REJECTING (${Date.now() - startTime}ms)`);
-        const existingItem = this.table.get(key0);
-        this._broadcastRejection(
-          websetId,
-          row.raw,
-          'exact_match',
-          `Exact key match: ${key0}`,
-          existingItem.raw
-        );
-        return; // Tier 0 exact
-      }
+    // For exact domain matches, still reject immediately
+    if (this.table.has(key0) && !this.entityType) {
+      console.log(`❌ DEDUP: Tier 0 exact match found - REJECTING (${Date.now() - startTime}ms)`);
+      const existingItem = this.table.get(key0);
+      await this._broadcastRejection(
+        websetId,
+        row.raw,
+        'exact_match',
+        `Exact key match: ${key0}`,
+        existingItem.raw
+      );
+      return;
     }
 
-    // IMPROVEMENT 11: Different fuzzy matching approach for entities vs companies
-    let allSimilarEntities = []; // Declare outside for broader scope
+    // Collect potential duplicates through multiple methods
+    const candidatePool = new Set();
     
     if (this.entityType) {
       // For entities: Collect ALL potential duplicates for comprehensive LLM decision
       let fuzzyChecks = 0;
+      const allSimilarEntities = [];  // Initialize array for collecting similar entities
       
       for (const other of this.table.values()) {
         fuzzyChecks++;
@@ -200,228 +221,158 @@ export class DedupService {
       }
       console.log(`🔍 DEDUP: Entity fuzzy check complete (${fuzzyChecks} comparisons), found ${allSimilarEntities.length} potential matches`);
       
-      // Proceed to vector search to find more potential duplicates
+      // If no similar entities found, accept immediately
+      if (allSimilarEntities.length === 0) {
+        console.log(`✅ DEDUP: No similar entities found - ACCEPTING immediately (${Date.now() - startTime}ms)`);
+        await this._accept(row, websetId);
+        return;
+      }
+
+      // Queue for LLM verification with all similar entities
+      console.log(`⏳ DEDUP: Queueing entity for LLM verification against ${allSimilarEntities.length} similar entities`);
+      this._queueEntityLLMDecision(row, allSimilarEntities, websetId);
       
     } else {
-      // For companies: Keep original single greyMatch logic
-      let greyMatch = null;
+      // Enhanced company duplicate detection
+      const candidatePool = new Set();  // Initialize Set for collecting candidates
+      
+      // 1. Collect fuzzy matches
       let fuzzyChecks = 0;
       for (const other of this.table.values()) {
         fuzzyChecks++;
         const res = this._fuzzyDup(row, other);
         if (res === true) {
-          console.log(`❌ DEDUP: Tier 1 fuzzy match found with ${other.name} - REJECTING (${Date.now() - startTime}ms, ${fuzzyChecks} checks)`);
-          this._broadcastRejection(
+          // Still reject on very high similarity
+          console.log(`❌ DEDUP: Very high similarity match with ${other.name} - REJECTING (${Date.now() - startTime}ms)`);
+          await this._broadcastRejection(
             websetId,
             row.raw,
-            'fuzzy_match',
-            `Similar to: ${other.name}`,
+            'high_similarity_match',
+            `Very similar to: ${other.name}`,
             other.raw
           );
-          return;          // confirmed dup
-        }
-        if (res === null && !greyMatch) greyMatch = other;
-      }
-      console.log(`🔍 DEDUP: Fuzzy check complete (${fuzzyChecks} comparisons), greyMatch: ${greyMatch ? greyMatch.name : 'none'}`);
-
-      if (!greyMatch) {
-        console.log(`✅ DEDUP: No conflicts found - ACCEPTING immediately (${Date.now() - startTime}ms)`);
-        if (this.entityType) {
-          await this._accept(row, websetId);
-        } else {
-          this._accept(row, websetId);
-        }
-        return;
-      }
-    }
-
-    // IMPROVEMENT 9: Hybrid vector search - different approaches for entities vs companies
-    if (this.entityType) {
-      // For entity searches: Smart similarity filtering for efficient LLM decisions
-      const normalizedTitle = this._normalizeEntityTitle(row.name);
-      console.log(`🔍 DEDUP: Entity vector search with normalized title: "${normalizedTitle}"`);
-      
-      // Combine fuzzy matches and vector search for comprehensive candidate pool
-      const candidatePool = [...allSimilarEntities];
-      
-      // Add vector search results to candidate pool
-      let titleHits = await vecQuery(normalizedTitle, 5); // Keep focused on top 5
-      if (!Array.isArray(titleHits)) {
-        console.warn(`⚠️ DEDUP: vecQuery returned non-array result:`, titleHits);
-        titleHits = [];
-      }
-      const vectorCandidates = titleHits
-        .map(id => {
-          // Check table first, then extract from pending if needed
-          if (this.table.has(id)) {
-            return this.table.get(id);
-          }
-          // Skip pending items for now as they're still being processed
-          return null;
-        })
-        .filter(item => item); // Remove null entries
-      
-      // Add unique vector candidates
-      for (const candidate of vectorCandidates) {
-        if (!candidatePool.some(existing => existing.rowId === candidate.rowId)) {
-          candidatePool.push(candidate);
-        }
-      }
-      
-      console.log(`🔍 DEDUP: Raw candidate pool: ${candidatePool.length} entities`);
-      
-      // IMPROVEMENT 13A: URL resolution for high-similarity candidates (COMPANY flow only)
-      const urlResolutionEnabled = process.env.ENABLE_URL_RESOLUTION === 'true';
-      if (urlResolutionEnabled && !this.entityType) {
-        console.log(`🌐 DEDUP: URL resolution enabled for COMPANY flow - checking ${candidatePool.length} candidates`);
-        for (const candidate of candidatePool) {
-          if (candidate && candidate.name) {
-            const urlResolutionResult = await this._resolveUrlIfSuspicious(row, candidate);
-            if (urlResolutionResult === true) {
-              console.log(`❌ DEDUP: URL resolution confirms duplicate with ${candidate.name} - REJECTING`);
-            this._broadcastRejection(
-              websetId,
-              row.raw,
-              'url_resolution_duplicate',
-              `URL resolution confirms duplicate of: ${candidate.name}`,
-              candidate.raw
-            );
-              return;
-            }
-          }
-        }
-      } else {
-        if (this.entityType) {
-          console.log(`🌐 DEDUP: URL resolution skipped for ENTITY flow (entities have bulletproof name matching)`);
-        } else if (!urlResolutionEnabled) {
-          console.log(`🌐 DEDUP: URL resolution disabled for COMPANY flow (set ENABLE_URL_RESOLUTION=true to enable)`);
-        }
-      }
-      
-      // Smart filtering: Calculate name similarity scores and keep only high-quality matches
-      const highQualityCandidates = candidatePool
-        .filter(candidate => candidate && candidate.name) // Filter out null/undefined candidates
-        .map(candidate => {
-          const normalizedCandidate = this._normalizeEntityTitle(candidate.name);
-          // Ensure both strings are valid before similarity calculation
-          if (!normalizedTitle || !normalizedCandidate) {
-            return { candidate, similarity: 0, normalizedName: normalizedCandidate };
-          }
-          const similarity = natural.JaroWinklerDistance(normalizedTitle, normalizedCandidate);
-          return { candidate, similarity: isNaN(similarity) ? 0 : similarity, normalizedName: normalizedCandidate };
-        })
-        .filter(item => item.similarity > 0.6) // Only reasonably similar items
-        .sort((a, b) => b.similarity - a.similarity) // Sort by similarity desc
-        .slice(0, 3); // Top 3 most similar for LLM
-      
-      console.log(`🔍 DEDUP: High-quality candidates: ${highQualityCandidates.length}`, 
-        highQualityCandidates.map(item => `${item.candidate.name} (${item.similarity.toFixed(3)})`));
-      
-      // If no high-quality candidates, accept immediately
-      if (highQualityCandidates.length === 0) {
-        console.log(`✅ DEDUP: No high-quality similar entities found - ACCEPTING immediately (${Date.now() - startTime}ms)`);
-        if (this.entityType) {
-          await this._accept(row, websetId);
-        } else {
-          this._accept(row, websetId);
-        }
-        return;
-      }
-      
-      // If very high similarity (>0.9), auto-reject to save LLM call
-      const veryHighSim = highQualityCandidates.find(item => item.similarity > 0.9);
-      if (veryHighSim) {
-        console.log(`❌ DEDUP: Very high similarity (${veryHighSim.similarity.toFixed(3)}) with ${veryHighSim.candidate.name} - REJECTING immediately`);
-        this.broadcast(websetId, { 
-          type: 'rejected', 
-          item: row.raw,
-          reason: 'entity_very_high_similarity',
-          existingItem: veryHighSim.candidate.raw,
-          details: `Very similar to: ${veryHighSim.candidate.name} (${veryHighSim.similarity.toFixed(3)})`
-        });
-        return;
-      }
-      
-      // Send to LLM for nuanced decision with focused context
-      console.log(`⏳ DEDUP: Queueing entity for LLM verification against ${highQualityCandidates.length} high-quality candidates`);
-      this._queueEntityLLMDecision(row, highQualityCandidates.map(item => item.candidate), websetId);
-      return;
-      
-      // Skip domain-based search for entities (less relevant)
-      
-    } else {
-      // For company searches: keep original logic
-      const hits = await vecQuery(row.name || row.url, 5);
-      if (hits.some(id => this.pending.has(id) || this.table.has(id))) {
-        console.log(`❌ DEDUP: Near‑duplicate found - REJECTING (${Date.now() - startTime}ms)`);
-        this.broadcast(websetId, { 
-          type: 'rejected', 
-          item: row.raw,
-          reason: 'near_duplicate',
-          existingItem: hits.map(id => this.table.get(id).raw),
-          details: `Near‑duplicate found: ${hits.map(id => this.table.get(id).name).join(', ')}`
-        });
-        return;
-      }
-
-      // Enhanced URL-based similarity detection for companies
-      if (row.url && row.url !== row.name) {
-        const urlHits = await vecQuery(row.url, 3);
-        if (urlHits.some(id => this.pending.has(id) || this.table.has(id))) {
-          console.log(`❌ DEDUP: URL-based near‑duplicate found - REJECTING (${Date.now() - startTime}ms)`);
-          this.broadcast(websetId, { 
-            type: 'rejected', 
-            item: row.raw,
-            reason: 'url_near_duplicate',
-            existingItem: urlHits.map(id => this.table.get(id).raw),
-            details: `URL-based near‑duplicate found: ${urlHits.map(id => this.table.get(id).name).join(', ')}`
-          });
           return;
         }
+        if (res === null) {
+          candidatePool.add(other);
+        }
       }
-      
-      // Domain-based vector search for companies
-      if (row.etld1) {
-        const domainHits = await vecQuery(row.etld1, 5);
-        const matchingDomainItems = domainHits
-          .map(id => this.table.get(id))
-          .filter(item => item && item.etld1 === row.etld1);
-        
-        if (matchingDomainItems.length > 0) {
-          console.log(`🔍 DEDUP: Found ${matchingDomainItems.length} items with same domain ${row.etld1}`);
-          
-          // Check if any of these are similar subdomains
-          for (const existingItem of matchingDomainItems) {
-            if (this._areSubdomainsSimilar(row, existingItem)) {
-              console.log(`❌ DEDUP: Domain + subdomain similarity found - REJECTING (${Date.now() - startTime}ms)`);
-              this.broadcast(websetId, { 
-                type: 'rejected', 
-                item: row.raw,
-                reason: 'subdomain_duplicate',
-                existingItem: existingItem.raw,
-                details: `Similar subdomain of ${row.etld1}: ${existingItem.host} vs ${row.host}`
-              });
-              return;
+      console.log(`🔍 DEDUP: Fuzzy check complete (${fuzzyChecks} comparisons), found ${candidatePool.size} potential matches`);
+
+      // 2. Add vector search results
+      try {
+        // Search by name
+        const nameHits = await vecQuery(row.name || '', 5);
+        if (!Array.isArray(nameHits)) {
+          console.warn('⚠️ DEDUP: Invalid vector search results for name:', nameHits);
+        } else {
+          for (const id of nameHits) {
+            if (this.table.has(id)) {
+              candidatePool.add(this.table.get(id));
             }
           }
         }
+
+        // Search by URL if different from name
+        if (row.url && row.url !== row.name) {
+          const urlHits = await vecQuery(row.url, 3);
+          if (!Array.isArray(urlHits)) {
+            console.warn('⚠️ DEDUP: Invalid vector search results for URL:', urlHits);
+          } else {
+            for (const id of urlHits) {
+              if (this.table.has(id)) {
+                candidatePool.add(this.table.get(id));
+              }
+            }
+          }
+        }
+
+        // Search by domain for related companies
+        if (row.etld1) {
+          const domainHits = await vecQuery(row.etld1, 3);
+          if (!Array.isArray(domainHits)) {
+            console.warn('⚠️ DEDUP: Invalid vector search results for domain:', domainHits);
+          } else {
+            for (const id of domainHits) {
+              if (this.table.has(id)) {
+                candidatePool.add(this.table.get(id));
+              }
+            }
+          }
+        }
+      } catch (error) {
+        console.warn(`⚠️ DEDUP: Vector search failed (continuing with fuzzy matches):`, error.message);
       }
-    }
 
-    if (this._cacheHit(row, greyMatch)) {
-      console.log(`❌ DEDUP: Cache hit indicates duplicate - REJECTING (${Date.now() - startTime}ms)`);
-      this.broadcast(websetId, { 
-        type: 'rejected', 
-        item: row.raw,
-        reason: 'cache_hit',
-        existingItem: greyMatch.raw,
-        details: `Previously determined to be duplicate of: ${greyMatch.name}`
-      });
-      return;
-    }
+      // 3. Filter and rank candidates
+      const rankedCandidates = Array.from(candidatePool)
+        .filter(candidate => candidate && candidate.name) // Filter out invalid candidates
+        .map(candidate => {
+          const nameSimilarity = natural.JaroWinklerDistance(
+            (row.name || '').toLowerCase(),
+            (candidate.name || '').toLowerCase()
+          );
+          const domainSimilarity = row.etld1 === candidate.etld1 ? 1 : 0;
+          const brandSimilarity = row.brand === candidate.brand ? 1 : 0;
+          
+          // Combined score weighted towards name similarity
+          const score = (nameSimilarity * 0.6) + (domainSimilarity * 0.2) + (brandSimilarity * 0.2);
+          
+          return { candidate, similarity: score };
+        })
+        .filter(item => item.similarity > 0.3) // Keep only reasonably similar candidates
+        .sort((a, b) => b.similarity - a.similarity)
+        .slice(0, 5); // Keep top 5 most similar for LLM
 
-    console.log(`⏳ DEDUP: Queueing for LLM verification vs ${greyMatch.name} (${Date.now() - startTime}ms)`);
-    this._queueLLMPair(row, greyMatch, websetId);
+      console.log(`🔍 DEDUP: Found ${rankedCandidates.length} high-quality candidates for LLM verification`);
+
+      // If no candidates found, accept immediately
+      if (rankedCandidates.length === 0) {
+        console.log(`✅ DEDUP: No similar companies found - ACCEPTING immediately (${Date.now() - startTime}ms)`);
+        await this._accept(row, websetId);
+        return;
+      }
+
+      // Queue for LLM verification with all good candidates
+      console.log(`⏳ DEDUP: Queueing company for LLM verification against ${rankedCandidates.length} candidates`);
+      this._queueCompanyLLMDecision(row, rankedCandidates.map(r => r.candidate), websetId);
+    }
+  }
+
+  // New method for company LLM decisions
+  _queueCompanyLLMDecision(newCompany, similarCompanies, websetId) {
+    const companyDecision = {
+      type: 'company_decision',
+      idNew: newCompany.rowId,
+      nameNew: newCompany.name,
+      urlNew: newCompany.url,
+      brandNew: newCompany.brand,
+      etld1New: newCompany.etld1,
+      similarCompanies: similarCompanies
+        .filter(company => company && company.rowId)
+        .map(company => ({
+          id: company.rowId,
+          name: company.name || 'Unknown',
+          url: company.url || '',
+          brand: company.brand,
+          etld1: company.etld1
+        })),
+      websetId,
+      rawNew: newCompany.raw
+    };
+    
+    this.pending.set(newCompany.rowId, companyDecision);
+    console.log(`⏳ COMPANY: Broadcasting PENDING for ${newCompany.name} (checking against ${similarCompanies.length} candidates)`);
+    this.broadcast(websetId, { type: 'pending', tmpId: newCompany.rowId });
+
+    this.batch.push(companyDecision);
+    if (this.batch.length >= LLM_BATCH) {
+      console.log(`🚀 COMPANY: Batch full (${LLM_BATCH}), flushing to LLM immediately`);
+      this._flushBatch();
+    } else if (!this.batchTimer) {
+      console.log(`⏲️ COMPANY: Starting batch timer (${LLM_LAT_MS}ms) for ${this.batch.length} items`);
+      this.batchTimer = setTimeout(() => this._flushBatch(), LLM_LAT_MS);
+    }
   }
 
   /* ---------------- internal ---------------- */
@@ -443,6 +394,21 @@ export class DedupService {
   }
 
   _canonItem(item) {
+    if (!item) {
+      console.warn('⚠️ DEDUP: Received null/undefined item in _canonItem');
+      return {
+        rowId: crypto.randomUUID(),
+        name: '',
+        url: '',
+        host: '',
+        brand: '',
+        etld1: '',
+        subCls: 'other',
+        isVideoPlatform: false,
+        raw: {}
+      };
+    }
+
     let u = '';
     
     if (item.properties?.url) {
@@ -521,12 +487,19 @@ export class DedupService {
     const etld1 = info.domain || '';
     const subCls = GENERIC_SUBS.has(info.subdomain || '') ? 'generic' : 'other';
     
+    // Special handling for video platforms - don't use domain for key0
+    const isVideoPlatform = VIDEO_PLATFORMS.has(etld1);
+    const key0 = isVideoPlatform ? 
+      `video:${name.toLowerCase().replace(/[^a-z0-9]/g, '')}` : 
+      `${brand}:${etld1}:${subCls}`;
+    
     const canonicalized = {
       rowId:  item.id || crypto.randomUUID(),
       name:   (name || '').trim(),
       url:    u,
       host:   info.hostname || '',
       brand, etld1, subCls,
+      isVideoPlatform,
       raw:    item
     };
     
@@ -563,9 +536,9 @@ export class DedupService {
     if (!title || typeof title !== 'string') return '';
     
     return title
-      // Remove years in various formats: (2009), - 2009, [2009], (1998-2009)
-      .replace(/[(\[\-]\s*\d{4}(\s*-\s*\d{4})?\s*[)\]]/g, '')
-      // Remove format specifiers: (TV Series), (Movie), (Book), (Film), (Anime)
+      // Remove years in YYYY format between 1900-2099
+      .replace(/[(\[\-]\s*(19|20)\d{2}(\s*-\s*(19|20)\d{2})?\s*[)\]]/g, '')
+      // Remove format specifiers: (TV Series), (Movie), (Film), (Book), (Anime)
       .replace(/\s*\([^)]*(?:TV Series|Movie|Film|Book|Anime|Series|Show)[^)]*\)/gi, '')
       // Enhanced: Remove standalone (TV) and any TV-related parenthetical content
       .replace(/\s*\(\s*TV\s*\)/gi, '')
@@ -580,9 +553,8 @@ export class DedupService {
       // Remove edition markers: Remastered, Director's Cut, Extended, Revised
       .replace(/\s*\b(?:Remastered|Director's\s*Cut|Extended|Revised|Special|Limited|Ultimate|Complete|Definitive)\s*(?:Edition|Version|Cut)?\b/gi, '')
       // BULLETPROOF: Remove trailer/promo content and everything after it  
-      .replace(/\s*[\-:\|\(\[\{]*\s*(?:Official\s+)?(?:\w+\s+)*?Trailer(?:\s*[#\d]+)?.*$/gi, '')
-      .replace(/\s*[\-:\|\(\[\{]*\s*(?:Official\s+)?(?:\w+\s+)*?Teaser(?:\s*Trailer)?.*$/gi, '')
-      .replace(/\s*(?:Official\s+)?(?:English\s+)?(?:Dubbed\s+)?(?:Subtitled\s+)?(?:Final\s+)?(?:International\s+)?(?:Red\s*Band\s+)?(?:Exclusive\s+)?(?:New\s+)?Trailer.*$/gi, '')
+      .replace(/\s*(?:(?:Official|Original|Classic|Theatrical)\s+)?(?:Movie\s+)?(?:Trailer|Teaser)(?:\s*[#\d]+)?.*$/gi, '')
+      .replace(/\s*(?:Official\s+)?(?:English\s+)?(?:Dubbed\s+)?(?:Subtitled\s+)?(?:Final\s+)?(?:International\s+)?(?:Red\s*Band\s+)?(?:Exclusive\s+)?(?:New\s+)?(?:Trailer|Teaser).*$/gi, '')
       .replace(/\s*[\-:\|\(\[\{]*\s*TV\s*Spot(?:\s*[#\d]+)?.*$/gi, '')
       .replace(/\s*[\-:\|\(\[\{]*\s*(?:Official\s*)?(?:Movie\s*)?Clip(?:\s*[#\d]+)?.*$/gi, '')
       .replace(/\s*[\-:\|\(\[\{]*\s*Behind\s*the\s*Scenes.*$/gi, '')
@@ -628,6 +600,17 @@ export class DedupService {
   }
 
   _fuzzyDup(a, b) {
+    // Special handling for video content - rely more on title similarity
+    if (a.isVideoPlatform || b.isVideoPlatform) {
+      const score = natural.JaroWinklerDistance(
+        this._normalizeEntityTitle(a.name),
+        this._normalizeEntityTitle(b.name)
+      );
+      console.log(`🔍 DEDUP: Video content title similarity: ${score.toFixed(3)}`);
+      // Use higher threshold for video content to avoid false positives
+      return score > 0.95 ? true : score > 0.85 ? null : false;
+    }
+    
     // IMPROVEMENT 4: Enhanced subdomain similarity detection
     if (this._areSubdomainsSimilar(a, b)) {
       console.log(`🔍 DEDUP: Similar subdomains detected: ${a.host} vs ${b.host}`);
@@ -784,12 +767,12 @@ export class DedupService {
 
   // IMPROVEMENT 10: Build contextual LLM prompts for better duplicate detection
   _buildLLMPrompt(batch) {
-    // Check if batch contains entity decisions (new approach) or pairs (old approach)
+    // Check if batch contains entity decisions or company decisions
     const entityDecisions = batch.filter(item => item.type === 'entity_decision');
-    const hasEntityDecisions = entityDecisions.length > 0;
+    const companyDecisions = batch.filter(item => item.type === 'company_decision');
     
-          if (hasEntityDecisions && this.entityType) {
-        // New entity approach: multiple candidates per entity
+    if (entityDecisions.length > 0) {
+      // New entity approach: multiple candidates per entity
       
       return `You are a duplicate detection expert for ${this.entityType} entities. For each new entity, determine if it's a duplicate of ANY of the provided similar entities.
 
@@ -816,33 +799,42 @@ ${JSON.stringify({
 
 Return JSON with "decisions" array where each element is [true] for DUPLICATE or [false] for UNIQUE.`;
       
-    } else if (this.entityType) {
-      // Legacy entity pairs approach
-      return `You are a duplicate detection expert for ${this.entityType} entities. Your task is to determine if pairs of items represent the same ${this.entityType}.
+    } else if (companyDecisions.length > 0) {
+      // New company decision prompt
+      return `You are a duplicate detection expert for companies and organizations. For each new company, determine if it's a duplicate of ANY of the provided similar companies.
 
-GUIDELINES FOR ${this.entityType.toUpperCase()} DUPLICATES:
-- Same title with different years/dates: DUPLICATE (e.g., "District 9" vs "District 9 (2009)")
-- Same content with format differences: DUPLICATE (e.g., "The Dark Knight" vs "Dark Knight, The")
-- Same content with edition variations: DUPLICATE (e.g., "Harry Potter" vs "Harry Potter: Extended Edition")
-- Different language versions of same content: DUPLICATE (e.g., "Spirited Away" vs "Sen to Chihiro no Kamikakushi")
-- Same series but different seasons/episodes: UNIQUE (e.g., "Breaking Bad S1" vs "Breaking Bad S2")
-- Completely different ${this.entityType}: UNIQUE
-- Similar but distinct works: UNIQUE (e.g., "The Matrix" vs "The Matrix Reloaded")
+GUIDELINES FOR COMPANY DUPLICATES:
+- Same company name with different domains: DUPLICATE (e.g., "Apple" on apple.com vs "Apple Inc." on apple.co.uk)
+- Same brand across regional sites: DUPLICATE (e.g., "McDonald's France" vs "McDonald's UK")
+- Different subsidiaries of same parent: UNIQUE (e.g., "Google" vs "YouTube")
+- Different brands entirely: UNIQUE (e.g., "Apple" vs "Microsoft")
+- Same company with/without legal suffixes: DUPLICATE (e.g., "Acme Corp" vs "Acme Corporation")
+- Different companies with similar names: UNIQUE (e.g., "American Airlines" vs "American Express")
+- Same company with different business units: UNIQUE (e.g., "Amazon.com" vs "Amazon Web Services")
 
-URLs (like IMDB, MyAnimeList) are less important - focus on content similarity.
+Focus on business identity rather than technical domain differences. Consider:
+1. Company name similarity
+2. Brand identity
+3. Domain relationships
+4. Business context
 
-Analyze these ${batch.length} pairs and return JSON with "pairs" array where each element is [true] for DUPLICATE or [false] for UNIQUE:
+For each company decision, return [true] if the new company is a DUPLICATE of any similar company, or [false] if it's UNIQUE.
 
 ${JSON.stringify({
-  pairs: batch.map(p => ({
-    name1: p.nameA,
-    url1: p.urlA,
-    name2: p.nameB,
-    url2: p.urlB
+  companyDecisions: companyDecisions.map(cd => ({
+    newCompany: {
+      name: cd.nameNew,
+      url: cd.urlNew,
+      brand: cd.brandNew,
+      domain: cd.etld1New
+    },
+    similarCompanies: cd.similarCompanies
   }))
-})}`;
+})}
+
+Return JSON with "decisions" array where each element is [true] for DUPLICATE or [false] for UNIQUE.`;
     } else {
-      // Company-specific prompt
+      // Legacy pairs approach
       return `You are a duplicate detection expert for companies and organizations. Your task is to determine if pairs of items represent the same company.
 
 GUIDELINES FOR COMPANY DUPLICATES:
@@ -970,7 +962,7 @@ ${JSON.stringify({
       // New entity decision format
       if (same) {
         // drop entity - broadcast as rejected  
-        this._broadcastRejection(
+        await this._broadcastRejection(
           p.websetId,
           p.rawNew,
           'entity_llm_duplicate',
@@ -997,7 +989,7 @@ ${JSON.stringify({
 
       if (same) {
         // drop row A - broadcast as rejected
-        this._broadcastRejection(
+        await this._broadcastRejection(
           p.websetId,
           p.rawA,
           'llm_duplicate',
@@ -1010,19 +1002,22 @@ ${JSON.stringify({
         // accept row A
         const aCanon = this._canonItem({ ...p.rawA, url: p.urlA, name: p.nameA });
         if (this.entityType) {
-          await this._accept(aCanon, p.websetId);
+          await this._accept(aCanon, p.websetId, true); // Skip broadcast here
         } else {
-          this._accept(aCanon, p.websetId);
+          await this._accept(aCanon, p.websetId, true); // Skip broadcast here
         }
-        this.broadcast(p.websetId, { type: 'confirm', data: p.rawA });
+        this.broadcast(p.websetId, { type: 'confirm', data: p.rawA }); // Only broadcast once
         this.pending.delete(p.idA);
       }
     }
   }
 
-  async _accept(row, websetId) {
+  async _accept(row, websetId, skipBroadcast = false) {
     const key0 = `${row.brand}:${row.etld1}:${row.subCls}`;
     this.table.set(key0, row);
+    
+    // Save accepted item to MongoDB
+    await this._saveItemToMongoDB(websetId, row, 'accepted');
     
     if (this.entityType) {
       // BULLETPROOF: Entity-only tracking for instant duplicate detection
@@ -1063,11 +1058,14 @@ ${JSON.stringify({
       console.log(`✅ DEDUP: COMPANY ACCEPTED ${row.rowId} (${row.name}) - original flow`);
     }
     
-    this.broadcast(websetId, { type: 'item', item: row.raw });
+    // Only broadcast if not skipped (to avoid double broadcasts)
+    if (!skipBroadcast) {
+      this.broadcast(websetId, { type: 'item', item: row.raw });
+    }
   }
 
   // FIXED: Standardized rejection broadcast with complete data
-  _broadcastRejection(websetId, item, reason, details, existingItem = null) {
+  async _broadcastRejection(websetId, item, reason, details, existingItem = null) {
     // Use the same sophisticated name extraction as _canonItem
     let extractedName = '';
     
@@ -1133,6 +1131,19 @@ ${JSON.stringify({
       details: details,
       existingItem: existingItem
     });
+    
+    // Save rejected item to MongoDB
+    const rejectionData = {
+      rejectedBy: existingItem?.id || null,
+      reason,
+      details
+    };
+    await this._saveItemToMongoDB(websetId, { 
+      id: enhancedItem.id, 
+      name: extractedName, 
+      url: enhancedItem.url,
+      raw: enhancedItem 
+    }, 'rejected', rejectionData);
   }
 
   // IMPROVEMENT 13: Strategic URL resolution for suspicious cases (optional)
@@ -1273,6 +1284,174 @@ ${JSON.stringify({
     }
   }
   
+  // MongoDB persistence helper methods
+  async _saveItemToMongoDB(websetId, row, status, rejectionData = null) {
+    if (!websetId || !row) {
+      console.error('❌ DEDUP: Invalid parameters for MongoDB save:', { websetId, row });
+      return;
+    }
+
+    try {
+      // Generate fallback values to prevent validation errors
+      const generateFallbackId = () => {
+        if (row.id) return row.id;
+        if (row.raw?.id) return row.raw.id;
+        return `item_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
+      };
+
+      const generateFallbackName = () => {
+        // Try multiple sources for name
+        const nameSources = [
+          row.name,
+          row.title,
+          row.raw?.name,
+          row.raw?.title,
+          row.raw?.properties?.name,
+          row.raw?.properties?.title,
+          row.raw?.properties?.company?.name
+        ];
+
+        // Get first non-empty value
+        const name = nameSources.find(n => n && typeof n === 'string' && n.trim());
+        if (name) return name.trim();
+
+        // Try extracting from URL
+        if (row.url) {
+          try {
+            const url = new URL(row.url);
+            // Try domain without TLD first
+            const domain = url.hostname.split('.').slice(0, -1).join('.');
+            if (domain) return domain;
+            // Fallback to full hostname
+            return url.hostname || row.url;
+          } catch {
+            return row.url;
+          }
+        }
+
+        // Ultimate fallback
+        return `Unknown Item ${Date.now()}`;
+      };
+
+      // Clean and validate properties
+      const cleanProperties = (props) => {
+        if (!props || typeof props !== 'object') return {};
+        
+        // Deep clone to avoid modifying original
+        const cleaned = JSON.parse(JSON.stringify(props));
+        
+        // Remove null/undefined values
+        Object.keys(cleaned).forEach(key => {
+          if (cleaned[key] === null || cleaned[key] === undefined) {
+            delete cleaned[key];
+          }
+        });
+        
+        return cleaned;
+      };
+
+      const itemData = {
+        websetId: websetId || `webset_${Date.now()}`,
+        itemId: generateFallbackId(),
+        name: generateFallbackName(),
+        url: row.url || row.raw?.url || row.raw?.properties?.url || '',
+        properties: cleanProperties(row.raw?.properties || row.properties || {}),
+        rawData: row.raw || row || {},
+        status: status || 'pending',
+        createdAt: new Date(),
+        normalizedTitle: this.entityType && (row.name || row.title) ? 
+          this._normalizeEntityTitle(row.name || row.title) : '',
+        entityType: this.entityType || null
+      };
+      
+      if (status === 'rejected' && rejectionData) {
+        itemData.rejectedBy = rejectionData.rejectedBy || null;
+        itemData.rejectionReason = rejectionData.reason || 'unknown';
+        itemData.rejectionMessage = rejectionData.details || '';
+        if (typeof rejectionData.similarity === 'number') {
+          itemData.similarity = Math.max(0, Math.min(1, rejectionData.similarity));
+        }
+      }
+      
+      const item = new Item(itemData);
+      
+      try {
+        await item.save();
+        console.log(`📊 MongoDB: Saved ${status} item ${itemData.itemId} for webset ${websetId}`);
+      } catch (saveError) {
+        if (saveError.code === 11000) {
+          console.warn(`⚠️ MongoDB: Duplicate key error for ${itemData.itemId}, skipping`);
+          return;
+        }
+        throw saveError; // Re-throw non-duplicate errors
+      }
+
+      // Update webset counters with retry logic and proper error handling
+      this._updateWebsetCountersAsync(websetId, status, rejectionData?.reason);
+      
+    } catch (error) {
+      console.error(`❌ MongoDB: Failed to save item:`, error);
+      // Don't throw - continue processing even if DB save fails
+    }
+  }
+
+  // Separate async method for webset counter updates with proper concurrency control
+  async _updateWebsetCountersAsync(websetId, status, rejectionReason) {
+    // Use a small random delay to reduce concurrent access
+    const delay = Math.floor(Math.random() * 100);
+    setTimeout(async () => {
+      try {
+        let retryCount = 0;
+        const maxRetries = 3;
+        
+        while (retryCount < maxRetries) {
+          try {
+            const webset = await Webset.findOne({ websetId });
+            if (!webset) {
+              console.warn(`⚠️ MongoDB: Webset ${websetId} not found for counter update`);
+              return;
+            }
+
+            // Use atomic operations instead of separate method calls
+            const updateOps = {};
+            updateOps.$inc = { totalItems: 1 };
+            
+            if (status === 'accepted') {
+              updateOps.$inc.uniqueItems = 1;
+            } else if (status === 'rejected') {
+              updateOps.$inc.duplicatesRejected = 1;
+              // Update rejection reason counters
+              const reasonKey = `rejectionReasons.${rejectionReason || 'unknown'}`;
+              updateOps.$inc[reasonKey] = 1;
+            }
+
+            await Webset.updateOne({ websetId }, updateOps);
+            console.log(`📊 MongoDB: Updated webset ${websetId} counters (${status})`);
+            return; // Success, exit retry loop
+            
+          } catch (updateError) {
+            retryCount++;
+            
+            if (updateError.name === 'ParallelSaveError' || updateError.code === 11000) {
+              if (retryCount < maxRetries) {
+                // Exponential backoff with jitter
+                const backoffDelay = Math.floor(Math.random() * (100 * Math.pow(2, retryCount)));
+                console.warn(`⚠️ MongoDB: Parallel save conflict for webset ${websetId}, retrying in ${backoffDelay}ms (attempt ${retryCount}/${maxRetries})`);
+                await new Promise(resolve => setTimeout(resolve, backoffDelay));
+                continue;
+              }
+            }
+            
+            throw updateError; // Re-throw if not a parallel save error or max retries reached
+          }
+        }
+      } catch (error) {
+        console.error(`⚠️ MongoDB: Failed to update webset counters after ${maxRetries} retries:`, error);
+        // Don't throw - just log the error and continue
+      }
+    }, delay);
+  }
+  
   // Utility: Get URL resolution cache statistics
   static getUrlResolutionStats() {
     if (!globalThis.urlResolutionCache) {
@@ -1304,6 +1483,12 @@ ${JSON.stringify({
       
       console.log(`🧹 DEDUP: Cleared bulletproof cache - ${titleCount} titles, ${urlCount} URLs`);
     }
+  }
+
+  // Add method to clear processed items (useful for testing or new websets)
+  clearProcessedItems() {
+    this.processedIds.clear();
+    console.log('🧹 DEDUP: Cleared processed items tracking');
   }
 
   _hostFromUrl(u) {

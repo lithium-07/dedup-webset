@@ -2,8 +2,9 @@ import { useState, useEffect, useRef } from 'react';
 import React from 'react';
 import { useSnackbar } from 'notistack';
 import styles from './StreamingResultsTable.module.css';
+import SemanticSearch from './SemanticSearch';
 
-export default function StreamingResultsTable({ websetId }) {
+export default function StreamingResultsTable({ websetId, historicalData }) {
   const [items, setItems] = useState([]);
   const [rejectedItems, setRejectedItems] = useState([]);
   const [showRejected, setShowRejected] = useState(false);
@@ -19,10 +20,22 @@ export default function StreamingResultsTable({ websetId }) {
   const [duplicateCounts, setDuplicateCounts] = useState({});
   const [duplicateMap, setDuplicateMap] = useState({});
   
+  const [showSemanticSearch, setShowSemanticSearch] = useState(false);
+
+  
   const eventSourceRef = useRef(null);
   const { enqueueSnackbar } = useSnackbar();
 
   useEffect(() => {
+    // If we have historical data, use it instead of connecting to SSE
+    if (historicalData) {
+      setItems(historicalData.items);
+      setRejectedItems(historicalData.rejectedItems);
+      setStatus(historicalData.status);
+      updateColumns(historicalData.items);
+      return; // Skip SSE connection
+    }
+
     if (!websetId) return;
 
     // Set status to processing immediately
@@ -32,6 +45,7 @@ export default function StreamingResultsTable({ websetId }) {
     setRejectedItems([]);
     setColumns([]);
     setSortConfig({ key: null, direction: null });
+
 
     // Create EventSource for streaming
     const eventSource = new EventSource(`http://localhost:3000/api/websets/${websetId}/stream`);
@@ -45,11 +59,16 @@ export default function StreamingResultsTable({ websetId }) {
           case 'connected':
             setStatus('processing');
             setError(null);
-            enqueueSnackbar('Stream connected, waiting for results...', { variant: 'success' });
+            enqueueSnackbar('Stream connected, processing items...', { variant: 'success' });
             break;
             
           case 'status':
-            setStatus(data.status);
+            if (data.status !== status) {  // Only update if status has changed
+              setStatus(data.status);
+              if (data.status === 'finished') {
+                enqueueSnackbar('Processing completed', { variant: 'success' });
+              }
+            }
             break;
             
           case 'item':
@@ -170,7 +189,7 @@ export default function StreamingResultsTable({ websetId }) {
         eventSourceRef.current.close();
       }
     };
-  }, [websetId]);
+  }, [websetId, historicalData]);
 
   const formatDate = (dateString) => {
     if (!dateString) return 'Just now';
@@ -350,9 +369,10 @@ export default function StreamingResultsTable({ websetId }) {
   const getStatusColor = () => {
     switch (status) {
       case 'processing': return '#2563eb';
+      case 'processing_items': return '#2563eb';
       case 'connecting': return '#f59e0b';
       case 'error': return '#dc2626';
-      default: return '#16a34a';
+      default: return status.startsWith('finished') ? '#16a34a' : '#2563eb';
     }
   };
 
@@ -507,6 +527,8 @@ export default function StreamingResultsTable({ websetId }) {
   const hasAnyExpanded = expandedItems.size > 0;
   const canExpandCollapse = Object.keys(duplicateCounts).length > 0;
 
+
+
   // Render duplicate count badge (now clickable)
   const renderDuplicateBadge = (item) => {
     if (!clusteringEnabled || !duplicateCounts[item.id]) return null;
@@ -628,6 +650,8 @@ export default function StreamingResultsTable({ websetId }) {
     }
   }, [rejectedItems, clusteringEnabled]);
 
+
+
   return (
     <div className={styles.container}>
       <div className={styles.statusBar}>
@@ -636,7 +660,7 @@ export default function StreamingResultsTable({ websetId }) {
             className={styles.statusDot} 
             style={{ backgroundColor: getStatusColor() }}
           />
-          <span>Status: {status}</span>
+          <span>Status: {status === 'processing_items' ? 'Processing Items' : status}</span>
         </div>
         <div className={styles.itemCount}>
           Items received: {items.length}
@@ -646,6 +670,17 @@ export default function StreamingResultsTable({ websetId }) {
             </span>
           )}
         </div>
+
+        {/* Add semantic search toggle when processing is complete */}
+        {status.startsWith('finished') && items.length > 0 && (
+          <button
+            onClick={() => setShowSemanticSearch(!showSemanticSearch)}
+            className={`${styles.toggleButton} ${showSemanticSearch ? styles.activeToggle : ''}`}
+          >
+            {showSemanticSearch ? '📊 Show Table' : '🔍 Ask Questions'}
+          </button>
+        )}
+
         {/* Show rejected toggle only when clustering is OFF */}
         {!clusteringEnabled && rejectedItems.length > 0 && (
           <div className={styles.rejectedToggle}>
@@ -681,6 +716,8 @@ export default function StreamingResultsTable({ websetId }) {
             </button>
           </div>
         )}
+
+
       </div>
 
       {error && (
@@ -689,231 +726,238 @@ export default function StreamingResultsTable({ websetId }) {
         </div>
       )}
 
-              {items.length === 0 && !error ? (
-        status === 'processing' ? (
-          // Show skeleton table while streaming
-          <div className={styles.tableContainer}>
-            <table className={styles.table}>
-              <thead>
-                <tr>
-                  {[...Array(6)].map((_, index) => (
-                    <th key={`skeleton-header-${index}`} className={styles.resizableHeader}>
-                      <div className={styles.headerContent}>
-                        <span className={styles.sortableHeader}>
-                          <div className={styles.skeletonHeader}></div>
-                        </span>
-                      </div>
-                      <div className={styles.resizeHandle}></div>
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {[...Array(3)].map((_, index) => (
-                  <tr key={`skeleton-${index}`} className={styles.skeletonRow}>
-                    <td><div className={styles.skeleton}></div></td>
-                    <td><div className={styles.skeleton}></div></td>
-                    <td><div className={styles.skeleton}></div></td>
-                    <td><div className={styles.skeletonLong}></div></td>
-                    <td><div className={styles.skeleton}></div></td>
-                    <td><div className={styles.skeleton}></div></td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        ) : (
-          <div className={styles.loading}>
-            <div className={styles.spinner} />
-            <p>Waiting for results...</p>
-          </div>
-        )
-      ) : columns.length === 0 ? (
-        <div className={styles.loading}>
-          <p>No properties found in results...</p>
-        </div>
+      {/* Show either semantic search or table view */}
+      {showSemanticSearch ? (
+        <SemanticSearch websetId={websetId} items={items} />
       ) : (
-        <div className={styles.tableContainer}>
-          <table className={styles.table}>
-            <thead>
-              <tr>
-                {columns.map(column => (
-                  <th 
-                    key={column.key} 
-                    className={styles.resizableHeader}
-                    style={{ width: columnWidths[column.key] || 'auto' }}
-                  >
-                    <div 
-                      className={styles.headerContent}
-                      onClick={() => handleSort(column.key)}
-                    >
-                      <span className={styles.sortableHeader}>
-                        {column.label}{getSortIndicator(column.key)}
-                      </span>
-                    </div>
-                    <div 
-                      className={styles.resizeHandle}
-                      onMouseDown={handleMouseDown(column.key)}
-                    ></div>
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {sortedItems.map((item, index) => {
-                // Debug logging
-                console.log(`Row ${index + 1}:`, {
-                  hasProperties: !!item.properties,
-                  propertiesKeys: item.properties ? Object.keys(item.properties) : [],
-                  typeValue: item.properties ? item.properties.type : null,
-                  properties: item.properties
-                });
-                
-                // Determine row CSS classes based on item status
-                const getRowClassName = () => {
-                  let className = styles.itemRow;
-                  if (item._pending) {
-                    className += ` ${styles.pendingRow}`;
-                  } else if (item._confirmed) {
-                    className += ` ${styles.confirmedRow}`;
-                  }
-                  // NEW: Add clustering row class
-                  if (clusteringEnabled && duplicateCounts[item.id]) {
-                    className += ` ${styles.hasDuplicates}`;
-                  }
-                  return className;
-                };
-                
-                return (
-                  <React.Fragment key={item.id || index}>
-                    <tr className={getRowClassName()}>
-                      {columns.map((column, colIndex) => {
-                        let cellValue;
-                        
-                        if (column.key === '_index') {
-                          // Use original position in items array for sorting, but display index as received order
-                          cellValue = items.indexOf(item) + 1;
-                        } else if (column.key === '_type') {
-                          cellValue = item.properties ? item.properties.type : null;
-                        } else if (item.properties) {
-                          // First check if it's a direct property
-                          if (item.properties[column.key] != null) {
-                            cellValue = item.properties[column.key];
-                          } else {
-                            // Then check in nested objects
-                            for (const propKey of Object.keys(item.properties)) {
-                              const propValue = item.properties[propKey];
-                              if (propValue && typeof propValue === 'object' && !Array.isArray(propValue)) {
-                                if (propValue[column.key] != null) {
-                                  cellValue = propValue[column.key];
-                                  break;
+        <div>
+          {items.length === 0 && !error ? (
+            status === 'processing' || status === 'processing_items' || status === 'connecting' ? (
+              // Show skeleton table while streaming
+              <div className={styles.tableContainer}>
+                <table className={styles.table}>
+                  <thead>
+                    <tr>
+                      {[...Array(6)].map((_, index) => (
+                        <th key={`skeleton-header-${index}`} className={styles.resizableHeader}>
+                          <div className={styles.headerContent}>
+                            <span className={styles.sortableHeader}>
+                              <div className={styles.skeletonHeader}></div>
+                            </span>
+                          </div>
+                          <div className={styles.resizeHandle}></div>
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {[...Array(3)].map((_, index) => (
+                      <tr key={`skeleton-${index}`} className={styles.skeletonRow}>
+                        <td><div className={styles.skeleton}></div></td>
+                        <td><div className={styles.skeleton}></div></td>
+                        <td><div className={styles.skeleton}></div></td>
+                        <td><div className={styles.skeletonLong}></div></td>
+                        <td><div className={styles.skeleton}></div></td>
+                        <td><div className={styles.skeleton}></div></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className={styles.loading}>
+                <div className={styles.spinner} />
+                <p>Waiting to receive items...</p>
+              </div>
+            )
+          ) : columns.length === 0 ? (
+            <div className={styles.loading}>
+              <p>No properties found in results...</p>
+            </div>
+          ) : (
+            <div className={styles.tableContainer}>
+              <table className={styles.table}>
+                <thead>
+                  <tr>
+                    {columns.map(column => (
+                      <th 
+                        key={column.key} 
+                        className={styles.resizableHeader}
+                        style={{ width: columnWidths[column.key] || 'auto' }}
+                      >
+                        <div 
+                          className={styles.headerContent}
+                          onClick={() => handleSort(column.key)}
+                        >
+                          <span className={styles.sortableHeader}>
+                            {column.label}{getSortIndicator(column.key)}
+                          </span>
+                        </div>
+                        <div 
+                          className={styles.resizeHandle}
+                          onMouseDown={handleMouseDown(column.key)}
+                        ></div>
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {sortedItems.map((item, index) => {
+                    // Debug logging
+                    console.log(`Row ${index + 1}:`, {
+                      hasProperties: !!item.properties,
+                      propertiesKeys: item.properties ? Object.keys(item.properties) : [],
+                      typeValue: item.properties ? item.properties.type : null,
+                      properties: item.properties
+                    });
+                    
+                    // Determine row CSS classes based on item status
+                    const getRowClassName = () => {
+                      let className = styles.itemRow;
+                      if (item._pending) {
+                        className += ` ${styles.pendingRow}`;
+                      } else if (item._confirmed) {
+                        className += ` ${styles.confirmedRow}`;
+                      }
+                      // NEW: Add clustering row class
+                      if (clusteringEnabled && duplicateCounts[item.id]) {
+                        className += ` ${styles.hasDuplicates}`;
+                      }
+                      return className;
+                    };
+                    
+                    return (
+                      <React.Fragment key={item.id || index}>
+                        <tr className={getRowClassName()}>
+                          {columns.map((column, colIndex) => {
+                            let cellValue;
+                            
+                            if (column.key === '_index') {
+                              // Use original position in items array for sorting, but display index as received order
+                              cellValue = items.indexOf(item) + 1;
+                            } else if (column.key === '_type') {
+                              cellValue = item.properties ? item.properties.type : null;
+                            } else if (item.properties) {
+                              // First check if it's a direct property
+                              if (item.properties[column.key] != null) {
+                                cellValue = item.properties[column.key];
+                              } else {
+                                // Then check in nested objects
+                                for (const propKey of Object.keys(item.properties)) {
+                                  const propValue = item.properties[propKey];
+                                  if (propValue && typeof propValue === 'object' && !Array.isArray(propValue)) {
+                                    if (propValue[column.key] != null) {
+                                      cellValue = propValue[column.key];
+                                      break;
+                                    }
+                                  }
                                 }
                               }
                             }
-                          }
-                        }
-                        
-                        return (
-                          <td 
-                            key={column.key} 
-                            className={`${styles.cell} ${styles[`${column.type}Cell`] || ''}`}
-                            data-label={column.label}
-                          >
-                            <div className={styles.cellContent}>
-                              <div className={styles.cellValue}>
-                                {formatCellValue(cellValue, column.type)}
-                                {/* NEW: Add duplicate badge to first column */}
-                                {colIndex === 0 && renderDuplicateBadge(item)}
-                              </div>
-                              {/* NEW: Add expand button to last column */}
-                              {colIndex === columns.length - 1 && renderExpandButton(item)}
-                            </div>
+                            
+                            return (
+                              <td 
+                                key={column.key} 
+                                className={`${styles.cell} ${styles[`${column.type}Cell`] || ''}`}
+                                data-label={column.label}
+                              >
+                                <div className={styles.cellContent}>
+                                  <div className={styles.cellValue}>
+                                    {formatCellValue(cellValue, column.type)}
+                                    {/* NEW: Add duplicate badge to first column */}
+                                    {colIndex === 0 && renderDuplicateBadge(item)}
+                                  </div>
+                                  {/* NEW: Add expand button to last column */}
+                                  {colIndex === columns.length - 1 && renderExpandButton(item)}
+                                </div>
+                              </td>
+                            );
+                          })}
+                        </tr>
+                        {/* NEW: Render duplicate rows if expanded */}
+                        {renderDuplicateRows(item)}
+                      </React.Fragment>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {/* Rejected Items Section - Only show when clustering is disabled */}
+          {!clusteringEnabled && showRejected && rejectedItems.length > 0 && (
+            <div className={styles.rejectedSection}>
+              <h3 className={styles.rejectedTitle}>
+                🚫 Rejected Items ({rejectedItems.length})
+              </h3>
+              <div className={styles.tableContainer}>
+                <table className={styles.table}>
+                  <thead>
+                    <tr>
+                      <th>Rejection Reason</th>
+                      <th>Item Name</th>
+                      <th>URL</th>
+                      <th>Details</th>
+                      <th>Rejected At</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rejectedItems.map((item, index) => {
+                      const reasonLabels = {
+                        'exact_match': 'Exact Match',
+                        'fuzzy_match': 'Similar Name',
+                        'cache_hit': 'Previously Seen',
+                        'llm_duplicate': 'AI Detected Duplicate',
+                        'near_duplicate': 'Vector Similarity',
+                        // Enhanced entity rejection types
+                        'exact_url_duplicate': 'Exact URL Match',
+                        'normalized_title_duplicate': 'Identical Title',
+                        'entity_llm_duplicate': 'AI Entity Duplicate'
+                      };
+                      
+                      const reasonIcons = {
+                        'exact_match': '🎯',
+                        'fuzzy_match': '📊',
+                        'cache_hit': '💾',
+                        'llm_duplicate': '🤖',
+                        'near_duplicate': '🔍',
+                        // BULLETPROOF: New entity rejection icons  
+                        'exact_url_duplicate': '🔗',
+                        'normalized_title_duplicate': '🛡️',
+                        'entity_llm_duplicate': '🧠'
+                      };
+                      
+                      return (
+                        <tr key={`rejected-${index}`} className={styles.rejectedRow}>
+                          <td className={styles.reasonCell}>
+                            {reasonIcons[item._rejectionReason]} {reasonLabels[item._rejectionReason]}
                           </td>
-                        );
-                      })}
-                    </tr>
-                    {/* NEW: Render duplicate rows if expanded */}
-                    {renderDuplicateRows(item)}
-                  </React.Fragment>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-      )}
-      
-      {/* Rejected Items Section - Only show when clustering is disabled */}
-      {!clusteringEnabled && showRejected && rejectedItems.length > 0 && (
-        <div className={styles.rejectedSection}>
-          <h3 className={styles.rejectedTitle}>
-            🚫 Rejected Items ({rejectedItems.length})
-          </h3>
-          <div className={styles.tableContainer}>
-            <table className={styles.table}>
-              <thead>
-                <tr>
-                  <th>Rejection Reason</th>
-                  <th>Item Name</th>
-                  <th>URL</th>
-                  <th>Details</th>
-                  <th>Rejected At</th>
-                </tr>
-              </thead>
-              <tbody>
-                {rejectedItems.map((item, index) => {
-                  const reasonLabels = {
-                    'exact_match': 'Exact Match',
-                    'fuzzy_match': 'Similar Name',
-                    'cache_hit': 'Previously Seen',
-                    'llm_duplicate': 'AI Detected Duplicate',
-                    'near_duplicate': 'Vector Similarity',
-                    // Enhanced entity rejection types
-                    'exact_url_duplicate': 'Exact URL Match',
-                    'normalized_title_duplicate': 'Identical Title',
-                    'entity_llm_duplicate': 'AI Entity Duplicate'
-                  };
-                  
-                  const reasonIcons = {
-                    'exact_match': '🎯',
-                    'fuzzy_match': '📊',
-                    'cache_hit': '💾',
-                    'llm_duplicate': '🤖',
-                    'near_duplicate': '🔍',
-                    // BULLETPROOF: New entity rejection icons  
-                    'exact_url_duplicate': '🔗',
-                    'normalized_title_duplicate': '🛡️',
-                    'entity_llm_duplicate': '🧠'
-                  };
-                  
-                  return (
-                    <tr key={`rejected-${index}`} className={styles.rejectedRow}>
-                      <td className={styles.reasonCell}>
-                        {reasonIcons[item._rejectionReason]} {reasonLabels[item._rejectionReason]}
-                      </td>
-                      <td>
-                        {item.properties?.company?.name || item.name || item.title || 'No name'}
-                      </td>
-                      <td className={styles.urlCell}>
-                        {item.properties?.url ? (
-                          <a href={item.properties.url} target="_blank" rel="noopener noreferrer">
-                            {item.properties.url.replace('https://', '').substring(0, 30)}...
-                          </a>
-                        ) : (
-                          'No URL'
-                        )}
-                      </td>
-                      <td className={styles.detailsCell}>
-                        {item._rejectionDetails}
-                      </td>
-                      <td className={styles.timeCell}>
-                        {new Date(item._rejectedAt).toLocaleTimeString()}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+                          <td>
+                            {item.properties?.company?.name || item.name || item.title || 'No name'}
+                          </td>
+                          <td className={styles.urlCell}>
+                            {item.properties?.url ? (
+                              <a href={item.properties.url} target="_blank" rel="noopener noreferrer">
+                                {item.properties.url.replace('https://', '').substring(0, 30)}...
+                              </a>
+                            ) : (
+                              'No URL'
+                            )}
+                          </td>
+                          <td className={styles.detailsCell}>
+                            {item._rejectionDetails}
+                          </td>
+                          <td className={styles.timeCell}>
+                            {new Date(item._rejectedAt).toLocaleTimeString()}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>

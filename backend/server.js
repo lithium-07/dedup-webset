@@ -5,6 +5,9 @@ import Exa from 'exa-js';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { DedupService } from './dedup/dedupService.js';
+import { connectToMongoDB, getConnectionStatus } from './models/database.js';
+import Webset from './models/Webset.js';
+import Item from './models/Item.js';
 
 dotenv.config();
 
@@ -18,7 +21,8 @@ app.use(cors({
     origin: 'http://localhost:3001', // Next.js frontend
     credentials: true
 }));
-app.use(express.json());
+app.use(express.json({ limit: '50mb' })); // Increased limit for large webset data
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 if (!process.env.EXA_API_KEY) {
     console.error('EXA_API_KEY is required in .env file');
@@ -60,6 +64,21 @@ app.post('/api/websets', async (req, res) => {
         
         // Check if dedup is enabled via environment variable
         const dedupEnabled = process.env.ENABLE_DEDUP === 'true';
+
+        // Create MongoDB record for this webset
+        try {
+            const websetDoc = new Webset({
+                websetId: webset.id,
+                originalQuery: query || '',
+                entityType: entity || null,
+                status: 'active'
+            });
+            await websetDoc.save();
+            console.log(`📊 MongoDB: Created webset record ${webset.id}`);
+        } catch (dbError) {
+            console.error('⚠️ MongoDB: Failed to create webset record:', dbError);
+            // Continue processing even if DB save fails
+        }
 
         // Store the webset for streaming
         activeWebsets.set(webset.id, {
@@ -154,6 +173,18 @@ async function pollWebsetResults(websetId) {
 
         // Final status update - get final count using cursor pagination
         await fetchAllItemsWithCursor(websetId, websetData);
+        
+        // Mark webset as completed in MongoDB
+        try {
+            const websetDoc = await Webset.findOne({ websetId });
+            if (websetDoc) {
+                await websetDoc.markCompleted();
+                console.log(`📊 MongoDB: Marked webset ${websetId} as completed`);
+            }
+        } catch (dbError) {
+            console.error('⚠️ MongoDB: Failed to mark webset as completed:', dbError);
+        }
+        
         broadcastToClients(websetId, { 
             type: 'finished', 
             status: 'idle',
@@ -197,6 +228,13 @@ async function fetchAllItemsWithCursor(websetId, websetData) {
                 );
 
                 if (newItems.length > 0) {
+                    // Update status to show we're processing items
+                    broadcastToClients(websetId, { 
+                        type: 'status', 
+                        status: 'processing_items',
+                        itemCount: websetData.items.length + newItems.length
+                    });
+
                     const dedup = websetData.dedup;
                     
                     for (const item of newItems) {
@@ -271,7 +309,167 @@ app.get('/api/stats/url-resolution', (req, res) => {
     }
 });
 
-app.listen(PORT, () => {
-    console.log(`🚀 Server running on port ${PORT}`);
-    console.log(`📊 URL Resolution Stats: http://localhost:${PORT}/api/stats/url-resolution`);
-}); 
+// Database status endpoint
+app.get('/api/stats/database', (req, res) => {
+    try {
+        const status = getConnectionStatus();
+        res.json({
+            success: true,
+            mongodb: status,
+            description: status.isConnected 
+                ? "MongoDB is connected and ready"
+                : "MongoDB is not connected"
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Historical websets endpoint
+app.get('/api/history/websets', async (req, res) => {
+    try {
+        const limit = parseInt(req.query.limit) || 10;
+        const websets = await Webset.getRecentWebsets(limit);
+        res.json({
+            success: true,
+            websets,
+            total: websets.length
+        });
+    } catch (error) {
+        console.error('Error fetching websets:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Get specific webset details
+app.get('/api/history/websets/:websetId', async (req, res) => {
+    try {
+        const { websetId } = req.params;
+        const webset = await Webset.findOne({ websetId });
+        
+        if (!webset) {
+            return res.status(404).json({ error: 'Webset not found' });
+        }
+
+        // Get items for this webset
+        const items = await Item.getItemsByWebset(websetId);
+        const duplicateGroups = await Item.getDuplicateGroups(websetId);
+        const rejectionStats = await Item.getRejectionStats(websetId);
+
+        res.json({
+            success: true,
+            webset,
+            items: {
+                total: items.length,
+                accepted: items.filter(item => item.status === 'accepted'),
+                rejected: items.filter(item => item.status === 'rejected')
+            },
+            duplicateGroups,
+            rejectionStats
+        });
+    } catch (error) {
+        console.error('Error fetching webset details:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Overall statistics endpoint
+app.get('/api/stats/overview', async (req, res) => {
+    try {
+        const stats = await Webset.getWebsetStats();
+        res.json({
+            success: true,
+            stats: stats[0] || {
+                totalWebsets: 0,
+                totalItems: 0,
+                totalUnique: 0,
+                totalDuplicates: 0,
+                avgDuplicationRate: 0
+            }
+        });
+    } catch (error) {
+        console.error('Error fetching overview stats:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Proxy routes for semantic search service
+app.post('/api/semantic/index', async (req, res) => {
+    try {
+        const response = await fetch('http://localhost:9001/index', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(req.body)
+        });
+
+        if (!response.ok) {
+            throw new Error(`Semantic service error: ${response.status} ${response.statusText}`);
+        }
+
+        const data = await response.json();
+        res.json(data);
+    } catch (error) {
+        console.error('Error proxying to semantic service:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/api/semantic/search', async (req, res) => {
+    try {
+        const response = await fetch('http://localhost:9001/search', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(req.body)
+        });
+
+        if (!response.ok) {
+            throw new Error(`Semantic service error: ${response.status} ${response.statusText}`);
+        }
+
+        const data = await response.json();
+        res.json(data);
+    } catch (error) {
+        console.error('Error proxying to semantic service:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/semantic/collections', async (req, res) => {
+    try {
+        const response = await fetch('http://localhost:9001/collections');
+
+        if (!response.ok) {
+            throw new Error(`Semantic service error: ${response.status} ${response.statusText}`);
+        }
+
+        const data = await response.json();
+        res.json(data);
+    } catch (error) {
+        console.error('Error proxying to semantic service:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Initialize MongoDB connection and start server
+const startServer = async () => {
+    try {
+        // Connect to MongoDB
+        await connectToMongoDB();
+        
+        // Start the Express server
+        app.listen(PORT, () => {
+            console.log(`🚀 Server running on port ${PORT}`);
+            console.log(`📊 URL Resolution Stats: http://localhost:${PORT}/api/stats/url-resolution`);
+            console.log(`📊 Database Status: http://localhost:${PORT}/api/stats/database`);
+        });
+    } catch (error) {
+        console.error('💥 Failed to start server:', error);
+        process.exit(1);
+    }
+};
+
+startServer(); 

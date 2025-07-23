@@ -1,0 +1,185 @@
+.container {
+  padding: 1rem;
+  background: #fff;
+  border-radius: 8px;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+.indexPrompt {
+  text-align: center;
+  padding: 2rem;
+}
+
+.indexButton {
+  background: #2563eb;
+  color: white;
+  border: none;
+  padding: 0.75rem 1.5rem;
+  border-radius: 6px;
+  font-size: 1rem;
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+.indexButton:hover {
+  background: #1d4ed8;
+}
+
+.indexButton:disabled {
+  background: #93c5fd;
+  cursor: not-allowed;
+}
+
+.searchForm {
+  display: flex;
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+}
+
+.searchInput {
+  flex: 1;
+  padding: 0.75rem;
+  border: 2px solid #e5e7eb;
+  border-radius: 6px;
+  font-size: 1rem;
+  transition: border-color 0.2s;
+}
+
+.searchInput:focus {
+  outline: none;
+  border-color: #2563eb;
+}
+
+.searchButton {
+  background: #2563eb;
+  color: white;
+  border: none;
+  padding: 0.75rem 1.5rem;
+  border-radius: 6px;
+  font-size: 1rem;
+  cursor: pointer;
+  transition: background-color 0.2s;
+  white-space: nowrap;
+}
+
+.searchButton:hover {
+  background: #1d4ed8;
+}
+
+.searchButton:disabled {
+  background: #93c5fd;
+  cursor: not-allowed;
+}
+
+.results {
+  margin-top: 2rem;
+}
+
+.analysis {
+  background: #f8fafc;
+  padding: 1.5rem;
+  border-radius: 8px;
+  margin-bottom: 2rem;
+}
+
+.answer {
+  font-size: 1.1rem;
+  line-height: 1.6;
+  margin: 1rem 0;
+}
+
+.meta {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid #e5e7eb;
+}
+
+.confidence {
+  display: inline-block;
+  padding: 0.25rem 0.75rem;
+  background: #dbeafe;
+  color: #1e40af;
+  border-radius: 9999px;
+  font-size: 0.875rem;
+  margin-bottom: 0.5rem;
+}
+
+.reasoning {
+  color: #64748b;
+  font-size: 0.95rem;
+  margin: 0.5rem 0;
+}
+
+.relevantItems {
+  margin-top: 2rem;
+}
+
+.resultItem {
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 1rem;
+  margin-bottom: 1rem;
+  transition: border-color 0.2s;
+}
+
+.usedItem {
+  border-color: #2563eb;
+  border-width: 2px;
+}
+
+.itemHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.5rem;
+}
+
+.itemTitle {
+  font-weight: 600;
+  font-size: 1.1rem;
+}
+
+.itemScore {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: #64748b;
+  font-size: 0.875rem;
+}
+
+.usedBadge {
+  background: #dbeafe;
+  color: #1e40af;
+  padding: 0.25rem 0.5rem;
+  border-radius: 9999px;
+  font-size: 0.75rem;
+}
+
+.itemUrl {
+  display: block;
+  color: #2563eb;
+  text-decoration: none;
+  font-size: 0.9rem;
+  margin: 0.5rem 0;
+  word-break: break-all;
+}
+
+.itemUrl:hover {
+  text-decoration: underline;
+}
+
+.itemProperties {
+  margin-top: 0.75rem;
+  font-size: 0.9rem;
+}
+
+.property {
+  margin: 0.25rem 0;
+  color: #4b5563;
+}
+
+.property strong {
+  color: #1f2937;
+  margin-right: 0.25rem;
+} 
