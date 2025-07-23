@@ -206,13 +206,13 @@ export class DedupService {
         const res = this._fuzzyDup(row, other);
         if (res === true) {
           console.log(`❌ DEDUP: Entity fuzzy match found with ${other.name} - REJECTING (${Date.now() - startTime}ms, ${fuzzyChecks} checks)`);
-          this.broadcast(websetId, { 
-            type: 'rejected', 
-            item: row.raw,
-            reason: 'entity_fuzzy_match',
-            existingItem: other.raw,
-            details: `Entity similar to: ${other.name}`
-          });
+          await this._broadcastRejection(
+            websetId,
+            row.raw,
+            'entity_fuzzy_match',
+            `Entity similar to: ${other.name}`,
+            other.raw
+          );
           return;          // confirmed dup
         }
         if (res === null) {
