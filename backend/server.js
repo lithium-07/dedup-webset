@@ -60,7 +60,6 @@ app.post('/api/websets', async (req, res) => {
         
         // Check if dedup is enabled via environment variable
         const dedupEnabled = process.env.ENABLE_DEDUP === 'true';
-        console.log(`🔧 CONFIG: Deduplication ${dedupEnabled ? 'ENABLED' : 'DISABLED'}`);
 
         // Store the webset for streaming
         activeWebsets.set(webset.id, {
@@ -68,7 +67,8 @@ app.post('/api/websets', async (req, res) => {
             status: 'processing',
             items: [],
             clients: new Map(),
-            dedup: dedupEnabled ? new DedupService((wid, msg) => broadcastToClients(wid, msg)) : null
+            nextCursor: null, // Track cursor for pagination
+            dedup: dedupEnabled ? new DedupService((wid, msg) => broadcastToClients(wid, msg), entity) : null
         });
 
         res.json({ websetId: webset.id });
@@ -100,7 +100,13 @@ app.get('/api/websets/:id/stream', (req, res) => {
     // Store client connection
     const clientId = Date.now();
     if (!activeWebsets.has(websetId)) {
-        activeWebsets.set(websetId, { id: websetId, status: 'processing', items: [], clients: new Map() });
+        activeWebsets.set(websetId, { 
+            id: websetId, 
+            status: 'processing', 
+            items: [], 
+            clients: new Map(),
+            nextCursor: null
+        });
     }
     
     const websetData = activeWebsets.get(websetId);
@@ -132,54 +138,26 @@ async function pollWebsetResults(websetId) {
             timeout: 3000000, // 50 minutes
             pollInterval: 3000, // 3 seconds
             onPoll: async (status) => {
-                console.log(`Webset ${websetId} status: ${status}`);
-                
                 if (websetData) {
                     websetData.status = status;
                     broadcastToClients(websetId, { type: 'status', status });
                 }
 
-                // Get current items during polling
+                // Get current items during polling using cursor pagination
                 try {
-                    const itemsResponse = await exa.websets.items.list(websetId, { limit: 100 });
-                    
-                    if (websetData && itemsResponse.data) {
-                        const newItems = itemsResponse.data.filter(item => 
-                            !websetData.items.some(existing => existing.id === item.id)
-                        );
-
-                        // Add new items and broadcast them
-                        const dedup = websetData.dedup;
-
-                        console.log(`📦 SERVER: Processing ${newItems.length} new items for webset ${websetId}`);
-                        for (const item of newItems) {
-                            console.log(`📦 SERVER: Adding item ${item.id} (${item.name || item.title || 'no name'}) to webset`);
-                            websetData.items.push(item);
-                            
-                            if (dedup) {
-                                // Dedup service handles its own broadcasting via callback
-                                const dedupStart = Date.now();
-                                await dedup.ingest(websetId, item);
-                                console.log(`📦 SERVER: Dedup processing completed for ${item.id} (${Date.now() - dedupStart}ms)`);
-                            } else {
-                                // No dedup - broadcast directly
-                                console.log(`📦 SERVER: No dedup - broadcasting ${item.id} directly`);
-                                broadcastToClients(websetId, { type: 'item', item });
-                            }
-                        }
-                    }
+                    await fetchAllItemsWithCursor(websetId, websetData);
                 } catch (itemsError) {
                     console.error('Error fetching items during polling:', itemsError);
                 }
             }
         });
 
-        // Final status update
-        const finalItems = await exa.websets.items.list(websetId, { limit: 100 });
+        // Final status update - get final count using cursor pagination
+        await fetchAllItemsWithCursor(websetId, websetData);
         broadcastToClients(websetId, { 
             type: 'finished', 
             status: 'idle',
-            totalItems: finalItems.data.length
+            totalItems: websetData.items.length
         });
 
     } catch (error) {
@@ -188,26 +166,81 @@ async function pollWebsetResults(websetId) {
     }
 }
 
+// Function to fetch all items using cursor pagination
+async function fetchAllItemsWithCursor(websetId, websetData) {
+    if (!websetData) return;
+
+    let cursor = null;
+    let hasMore = true;
+    let totalFetched = 0;
+
+    // Initialize cursor tracking if not exists
+    if (!websetData.nextCursor) {
+        websetData.nextCursor = null;
+    }
+
+    // Use the saved cursor to continue from where we left off
+    cursor = websetData.nextCursor;
+
+    while (hasMore) {
+        try {
+            const options = { limit: 100 };
+            if (cursor) {
+                options.cursor = cursor;
+            }
+
+            const itemsResponse = await exa.websets.items.list(websetId, options);
+            
+            if (itemsResponse.data && itemsResponse.data.length > 0) {
+                const newItems = itemsResponse.data.filter(item => 
+                    !websetData.items.some(existing => existing.id === item.id)
+                );
+
+                if (newItems.length > 0) {
+                    const dedup = websetData.dedup;
+                    
+                    for (const item of newItems) {
+                        websetData.items.push(item);
+                        
+                        if (dedup) {
+                            // Dedup service handles its own broadcasting via callback
+                            const dedupStart = Date.now();
+                            await dedup.ingest(websetId, item);
+                        } else {
+                            // No dedup - broadcast directly
+                            broadcastToClients(websetId, { type: 'item', item });
+                        }
+                    }
+                }
+                totalFetched += itemsResponse.data.length;
+            }
+
+            // Update pagination state
+            hasMore = itemsResponse.hasMore || false;
+            cursor = itemsResponse.nextCursor || null;
+            websetData.nextCursor = cursor;
+
+            // Break if no more pages
+            if (!hasMore || !cursor) {
+                break;
+            }
+
+        } catch (error) {
+            console.error(`🔄 CURSOR: Error fetching page for webset ${websetId}:`, error);
+            break; // Stop pagination on error
+        }
+    }
+}
+
 // Broadcast message to all clients listening to a webset
 function broadcastToClients(websetId, message) {
-    console.log(`📡 BROADCAST: Sending ${message.type} to ${websetId}`, {
-        type: message.type,
-        hasItem: !!message.item,
-        itemName: message.item?.name || message.item?.title,
-        tmpId: message.tmpId,
-        status: message.status,
-        error: message.error
-    });
-    
     const websetData = activeWebsets.get(websetId);
     if (websetData && websetData.clients) {
         const clientCount = websetData.clients.size;
-        console.log(`📡 BROADCAST: Found ${clientCount} clients for webset ${websetId}`);
         
         websetData.clients.forEach((res, clientId) => {
             try {
                 res.write(`data: ${JSON.stringify(message)}\n\n`);
-                console.log(`📡 BROADCAST: Sent to client ${clientId}`);
             } catch (error) {
                 console.error(`📡 BROADCAST: Error writing to client ${clientId}:`, error);
             }
@@ -221,6 +254,4 @@ function broadcastToClients(websetId, message) {
 }
 
 app.listen(PORT, () => {
-    console.log(`Backend API server running on http://localhost:${PORT}`);
-    console.log('Make sure your EXA_API_KEY is set in the .env file');
 }); 

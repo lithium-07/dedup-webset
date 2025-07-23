@@ -6,6 +6,7 @@ import styles from '../styles/Home.module.css';
 
 export default function Home() {
   const [activeWebsetId, setActiveWebsetId] = useState(null);
+  const [searchQuery, setSearchQuery] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
   const { enqueueSnackbar } = useSnackbar();
 
@@ -30,6 +31,7 @@ export default function Home() {
 
       const { websetId } = await response.json();
       setActiveWebsetId(websetId);
+      setSearchQuery(queryData.query);
       enqueueSnackbar('Webset created successfully!', { variant: 'success' });
     } catch (error) {
       console.error('Error creating webset:', error);
@@ -41,6 +43,7 @@ export default function Home() {
 
   const handleNewQuery = () => {
     setActiveWebsetId(null);
+    setSearchQuery(null);
   };
 
   return (
@@ -53,6 +56,11 @@ export default function Home() {
           />
         ) : (
           <div className={styles.resultsContainer}>
+            {searchQuery && (
+              <div className={styles.searchQuery}>
+                <strong>Search Query:</strong> {searchQuery}
+              </div>
+            )}
             <div className={styles.resultHeader}>
               <h2>Streaming Results for Webset: {activeWebsetId}</h2>
               <button 

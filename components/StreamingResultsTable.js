@@ -646,7 +646,11 @@ export default function StreamingResultsTable({ websetId }) {
                     'fuzzy_match': 'Similar Name',
                     'cache_hit': 'Previously Seen',
                     'llm_duplicate': 'AI Detected Duplicate',
-                    'near_duplicate': 'Vector Similarity'
+                    'near_duplicate': 'Vector Similarity',
+                    // Enhanced entity rejection types
+                    'exact_url_duplicate': 'Exact URL Match',
+                    'normalized_title_duplicate': 'Identical Title',
+                    'entity_llm_duplicate': 'AI Entity Duplicate'
                   };
                   
                   const reasonIcons = {
@@ -654,7 +658,11 @@ export default function StreamingResultsTable({ websetId }) {
                     'fuzzy_match': '📊',
                     'cache_hit': '💾',
                     'llm_duplicate': '🤖',
-                    'near_duplicate': '🔍'
+                    'near_duplicate': '🔍',
+                    // BULLETPROOF: New entity rejection icons  
+                    'exact_url_duplicate': '🔗',
+                    'normalized_title_duplicate': '🛡️',
+                    'entity_llm_duplicate': '🧠'
                   };
                   
                   return (

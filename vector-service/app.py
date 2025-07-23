@@ -5,6 +5,9 @@ from sentence_transformers import SentenceTransformer
 import logging
 from datetime import datetime
 import base64
+import signal
+import sys
+import atexit
 
 # Configure detailed logging
 logging.basicConfig(
@@ -34,6 +37,7 @@ try:
     reverse_mapping = {}  # original_id -> numeric_id
     
     logger.info("🤖 Loading sentence transformer model...")
+    # Configure sentence transformer to use fewer processes and clean up properly
     model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
     
     # Test the model with a simple encoding
@@ -48,6 +52,47 @@ except Exception as e:
     raise e
 
 logger.info("✅ Vector service initialization complete!")
+
+# Cleanup function for proper resource management
+def cleanup_resources():
+    """Clean up resources properly on shutdown"""
+    try:
+        logger.info("🧹 Cleaning up vector service resources...")
+        
+        # Force cleanup of sentence transformer resources
+        if 'model' in globals():
+            # Clear the model's cache and close any open processes
+            try:
+                if hasattr(model, '_modules'):
+                    for module in model._modules.values():
+                        if hasattr(module, 'cpu'):
+                            module.cpu()
+                logger.info("✅ Model resources cleaned up")
+            except Exception as e:
+                logger.warning(f"⚠️ Model cleanup warning: {e}")
+        
+        # Clear global variables
+        globals().pop('model', None)
+        globals().pop('index', None)
+        globals().pop('id_mapping', None)
+        globals().pop('reverse_mapping', None)
+        
+        logger.info("✅ Resource cleanup completed")
+        
+    except Exception as e:
+        logger.error(f"❌ Error during cleanup: {e}")
+
+# Register cleanup handlers
+atexit.register(cleanup_resources)
+
+def signal_handler(signum, frame):
+    logger.info(f"🛑 Received signal {signum}, initiating graceful shutdown...")
+    cleanup_resources()
+    sys.exit(0)
+
+# Register signal handlers for graceful shutdown
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
 
 class AddReq(BaseModel):
     row_id: str
@@ -271,6 +316,8 @@ if __name__ == "__main__":
         )
     except KeyboardInterrupt:
         logger.info("🛑 Server stopped by user")
+        cleanup_resources()
     except Exception as e:
         logger.error(f"❌ Failed to start server: {e}")
+        cleanup_resources()
         raise e
