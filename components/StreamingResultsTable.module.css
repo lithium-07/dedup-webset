@@ -633,3 +633,207 @@
   color: #6b7280;
   min-width: 80px;
 }
+
+/* NEW: Clustering styles (easily removable) */
+
+/* Clustering toggle button */
+.clusteringToggle {
+  display: flex;
+  align-items: center;
+  margin-left: 0.5rem;
+}
+
+.activeToggle {
+  background: #10b981 !important;
+}
+
+.activeToggle:hover {
+  background: #059669 !important;
+}
+
+/* Expand all toggle */
+.expandAllToggle {
+  display: flex;
+  align-items: center;
+  margin-left: 0.5rem;
+}
+
+.expandAllButton {
+  background: #8b5cf6 !important;
+}
+
+.expandAllButton:hover {
+  background: #7c3aed !important;
+}
+
+/* Duplicate count badge */
+.duplicateBadge {
+  background: #3b82f6;
+  color: white;
+  border: none;
+  border-radius: 12px;
+  padding: 0.25rem 0.5rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  margin-left: 0.5rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.duplicateBadge:hover {
+  background: #2563eb;
+  transform: translateY(-1px);
+  box-shadow: 0 2px 4px rgba(59, 130, 246, 0.3);
+}
+
+/* Expand/collapse button */
+.expandButton {
+  background: #6b7280;
+  color: white;
+  border: none;
+  border-radius: 50%;
+  width: 24px;
+  height: 24px;
+  font-size: 0.8rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s ease;
+  margin-left: 0.5rem;
+  flex-shrink: 0;
+}
+
+.expandButton:hover {
+  background: #4b5563;
+  transform: scale(1.1);
+  box-shadow: 0 2px 4px rgba(107, 114, 128, 0.3);
+}
+
+/* Cell content wrapper */
+.cellContent {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  min-height: 24px;
+}
+
+/* Cell value wrapper */
+.cellValue {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  min-width: 0; /* Allow text truncation */
+}
+
+/* Parent rows with duplicates */
+.hasDuplicates {
+  background: #f8fafc;
+  border-left: 3px solid #3b82f6;
+}
+
+.hasDuplicates:hover {
+  background: #f1f5f9;
+}
+
+/* Duplicate rows */
+.duplicateRow {
+  background: #f0f9ff;
+  border-left: 3px solid #93c5fd;
+  opacity: 0.9;
+  animation: slideIn 0.3s ease;
+}
+
+.duplicateRow:hover {
+  background: #e0f2fe;
+}
+
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateY(-10px);
+  }
+  to {
+    opacity: 0.9;
+    transform: translateY(0);
+  }
+}
+
+/* Duplicate indicator (first column) */
+.duplicateIndicator {
+  padding-left: 2rem !important;
+  position: relative;
+  vertical-align: middle;
+}
+
+.duplicateIndicator::before {
+  content: "└─";
+  position: absolute;
+  left: 0.75rem;
+  top: 50%;
+  transform: translateY(-50%);
+  color: #93c5fd;
+  font-weight: bold;
+}
+
+.duplicateIcon {
+  font-size: 0.8rem;
+  color: #1e40af;
+  font-weight: 600;
+  padding: 0.25rem 0.5rem;
+  background: #dbeafe;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+
+/* Duplicate cells */
+.duplicateCell {
+  opacity: 0.8;
+  font-size: 0.85rem;
+  padding: 0.5rem 0.75rem !important;
+}
+
+/* Responsive clustering styles */
+@media (max-width: 768px) {
+  .duplicateBadge {
+    font-size: 0.7rem;
+    padding: 0.2rem 0.4rem;
+    margin-left: 0.25rem;
+  }
+  
+  .expandButton {
+    width: 20px;
+    height: 20px;
+    font-size: 0.7rem;
+  }
+  
+  .clusteringToggle,
+  .expandAllToggle {
+    margin-top: 0.5rem;
+    margin-left: 0;
+  }
+  
+  .duplicateIndicator::before {
+    display: none;
+  }
+  
+  .duplicateIndicator {
+    padding-left: 1rem !important;
+  }
+  
+  .cellContent {
+    flex-direction: row;
+    align-items: center;
+    gap: 0.25rem;
+  }
+  
+  .cellValue {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}

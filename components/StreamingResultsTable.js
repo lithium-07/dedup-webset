@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
+import React from 'react';
 import { useSnackbar } from 'notistack';
 import styles from './StreamingResultsTable.module.css';
 
@@ -11,6 +12,13 @@ export default function StreamingResultsTable({ websetId }) {
   const [columns, setColumns] = useState([]);
   const [columnWidths, setColumnWidths] = useState({});
   const [sortConfig, setSortConfig] = useState({ key: null, direction: null });
+  
+  // NEW: Clustering feature state (easily removable)
+  const [clusteringEnabled, setClusteringEnabled] = useState(true);
+  const [expandedItems, setExpandedItems] = useState(new Set());
+  const [duplicateCounts, setDuplicateCounts] = useState({});
+  const [duplicateMap, setDuplicateMap] = useState({});
+  
   const eventSourceRef = useRef(null);
   const { enqueueSnackbar } = useSnackbar();
 
@@ -449,6 +457,177 @@ export default function StreamingResultsTable({ websetId }) {
     return '';
   };
 
+  // NEW: Clustering helper functions (easily removable)
+  const buildDuplicateMaps = () => {
+    if (!clusteringEnabled) return;
+    
+    const counts = {};
+    const duplicatesByParent = {};
+    
+    rejectedItems.forEach(rejectedItem => {
+      const parentId = rejectedItem._existingItem?.id;
+      if (parentId) {
+        // Count duplicates per parent
+        counts[parentId] = (counts[parentId] || 0) + 1;
+        
+        // Group duplicates by parent
+        if (!duplicatesByParent[parentId]) {
+          duplicatesByParent[parentId] = [];
+        }
+        duplicatesByParent[parentId].push(rejectedItem);
+      }
+    });
+    
+    setDuplicateCounts(counts);
+    setDuplicateMap(duplicatesByParent);
+  };
+
+  const toggleItemExpansion = (itemId) => {
+    setExpandedItems(prev => {
+      const newSet = new Set(prev);
+      if (newSet.has(itemId)) {
+        newSet.delete(itemId);
+      } else {
+        newSet.add(itemId);
+      }
+      return newSet;
+    });
+  };
+
+  // NEW: Expand/collapse all functionality
+  const expandAllItems = () => {
+    const itemsWithDuplicates = Object.keys(duplicateCounts);
+    setExpandedItems(new Set(itemsWithDuplicates));
+  };
+
+  const collapseAllItems = () => {
+    setExpandedItems(new Set());
+  };
+
+  const hasAnyExpanded = expandedItems.size > 0;
+  const canExpandCollapse = Object.keys(duplicateCounts).length > 0;
+
+  // Render duplicate count badge (now clickable)
+  const renderDuplicateBadge = (item) => {
+    if (!clusteringEnabled || !duplicateCounts[item.id]) return null;
+    
+    const count = duplicateCounts[item.id];
+    const isExpanded = expandedItems.has(item.id);
+    
+    return (
+      <button
+        className={styles.duplicateBadge}
+        onClick={() => toggleItemExpansion(item.id)}
+        title={`${count} duplicate${count > 1 ? 's' : ''} found. Click to ${isExpanded ? 'collapse' : 'expand'}.`}
+      >
+        🔗 +{count}
+      </button>
+    );
+  };
+
+  // Render expand/collapse button for items with duplicates
+  const renderExpandButton = (item) => {
+    if (!clusteringEnabled || !duplicateCounts[item.id]) return null;
+    
+    const isExpanded = expandedItems.has(item.id);
+    
+    return (
+      <button
+        className={styles.expandButton}
+        onClick={() => toggleItemExpansion(item.id)}
+        title={`Click to ${isExpanded ? 'collapse' : 'expand'} duplicates`}
+      >
+        {isExpanded ? '▲' : '▼'}
+      </button>
+    );
+  };
+
+  // Render duplicate rows for expanded items
+  const renderDuplicateRows = (parentItem) => {
+    if (!clusteringEnabled || !expandedItems.has(parentItem.id) || !duplicateMap[parentItem.id]) {
+      return null;
+    }
+
+    return duplicateMap[parentItem.id].map((duplicate, index) => {
+      const reasonLabels = {
+        'exact_match': 'Exact Match',
+        'fuzzy_match': 'Similar Name',
+        'cache_hit': 'Previously Seen',
+        'llm_duplicate': 'AI Detected Duplicate',
+        'near_duplicate': 'Vector Similarity',
+        'exact_url_duplicate': 'Exact URL Match',
+        'normalized_title_duplicate': 'Identical Title',
+        'entity_llm_duplicate': 'AI Entity Duplicate'
+      };
+
+      const reasonIcons = {
+        'exact_match': '🎯',
+        'fuzzy_match': '📊',
+        'cache_hit': '💾',
+        'llm_duplicate': '🤖',
+        'near_duplicate': '🔍',
+        'exact_url_duplicate': '🔗',
+        'normalized_title_duplicate': '🛡️',
+        'entity_llm_duplicate': '🧠'
+      };
+
+      return (
+        <tr key={`duplicate-${parentItem.id}-${index}`} className={styles.duplicateRow}>
+          <td className={styles.duplicateIndicator}>
+            <span className={styles.duplicateIcon}>
+              {reasonIcons[duplicate._rejectionReason]} {reasonLabels[duplicate._rejectionReason]}
+            </span>
+          </td>
+          {columns.slice(1).map(column => {
+            let cellValue;
+            
+            if (column.key === '_type') {
+              cellValue = duplicate.properties ? duplicate.properties.type : null;
+            } else if (duplicate.properties) {
+              // First check if it's a direct property
+              if (duplicate.properties[column.key] != null) {
+                cellValue = duplicate.properties[column.key];
+              } else {
+                // Then check in nested objects
+                for (const propKey of Object.keys(duplicate.properties)) {
+                  const propValue = duplicate.properties[propKey];
+                  if (propValue && typeof propValue === 'object' && !Array.isArray(propValue)) {
+                    if (propValue[column.key] != null) {
+                      cellValue = propValue[column.key];
+                      break;
+                    }
+                  }
+                }
+              }
+            }
+            
+            return (
+              <td 
+                key={column.key} 
+                className={`${styles.cell} ${styles.duplicateCell}`}
+                data-label={column.label}
+              >
+                {formatCellValue(cellValue, column.type)}
+              </td>
+            );
+          })}
+        </tr>
+      );
+    });
+  };
+
+  // Update duplicate maps whenever rejected items change
+  useEffect(() => {
+    if (clusteringEnabled) {
+      buildDuplicateMaps();
+    } else {
+      // Clear expansion state when clustering is disabled
+      setExpandedItems(new Set());
+      setDuplicateCounts({});
+      setDuplicateMap({});
+    }
+  }, [rejectedItems, clusteringEnabled]);
+
   return (
     <div className={styles.container}>
       <div className={styles.statusBar}>
@@ -467,13 +646,38 @@ export default function StreamingResultsTable({ websetId }) {
             </span>
           )}
         </div>
-        {rejectedItems.length > 0 && (
+        {/* Show rejected toggle only when clustering is OFF */}
+        {!clusteringEnabled && rejectedItems.length > 0 && (
           <div className={styles.rejectedToggle}>
             <button 
               onClick={() => setShowRejected(!showRejected)}
               className={styles.toggleButton}
             >
               {showRejected ? 'Hide' : 'Show'} Rejected ({rejectedItems.length})
+            </button>
+          </div>
+        )}
+
+        {/* NEW: Expand/collapse all button when clustering is ON */}
+        {clusteringEnabled && canExpandCollapse && (
+          <div className={styles.expandAllToggle}>
+            <button 
+              onClick={hasAnyExpanded ? collapseAllItems : expandAllItems}
+              className={`${styles.toggleButton} ${styles.expandAllButton}`}
+            >
+              {hasAnyExpanded ? '🔼 Collapse All' : '🔽 Expand All'}
+            </button>
+          </div>
+        )}
+
+        {/* NEW: Clustering toggle (easily removable) */}
+        {rejectedItems.length > 0 && (
+          <div className={styles.clusteringToggle}>
+            <button 
+              onClick={() => setClusteringEnabled(!clusteringEnabled)}
+              className={`${styles.toggleButton} ${clusteringEnabled ? styles.activeToggle : ''}`}
+            >
+              {clusteringEnabled ? '🔗 Clustering On' : '📋 List View'}
             </button>
           </div>
         )}
@@ -573,48 +777,64 @@ export default function StreamingResultsTable({ websetId }) {
                   } else if (item._confirmed) {
                     className += ` ${styles.confirmedRow}`;
                   }
+                  // NEW: Add clustering row class
+                  if (clusteringEnabled && duplicateCounts[item.id]) {
+                    className += ` ${styles.hasDuplicates}`;
+                  }
                   return className;
                 };
                 
                 return (
-                  <tr key={item.id || index} className={getRowClassName()}>
-                    {columns.map(column => {
-                      let cellValue;
-                      
-                      if (column.key === '_index') {
-                        // Use original position in items array for sorting, but display index as received order
-                        cellValue = items.indexOf(item) + 1;
-                      } else if (column.key === '_type') {
-                        cellValue = item.properties ? item.properties.type : null;
-                      } else if (item.properties) {
-                        // First check if it's a direct property
-                        if (item.properties[column.key] != null) {
-                          cellValue = item.properties[column.key];
-                        } else {
-                          // Then check in nested objects
-                          for (const propKey of Object.keys(item.properties)) {
-                            const propValue = item.properties[propKey];
-                            if (propValue && typeof propValue === 'object' && !Array.isArray(propValue)) {
-                              if (propValue[column.key] != null) {
-                                cellValue = propValue[column.key];
-                                break;
+                  <React.Fragment key={item.id || index}>
+                    <tr className={getRowClassName()}>
+                      {columns.map((column, colIndex) => {
+                        let cellValue;
+                        
+                        if (column.key === '_index') {
+                          // Use original position in items array for sorting, but display index as received order
+                          cellValue = items.indexOf(item) + 1;
+                        } else if (column.key === '_type') {
+                          cellValue = item.properties ? item.properties.type : null;
+                        } else if (item.properties) {
+                          // First check if it's a direct property
+                          if (item.properties[column.key] != null) {
+                            cellValue = item.properties[column.key];
+                          } else {
+                            // Then check in nested objects
+                            for (const propKey of Object.keys(item.properties)) {
+                              const propValue = item.properties[propKey];
+                              if (propValue && typeof propValue === 'object' && !Array.isArray(propValue)) {
+                                if (propValue[column.key] != null) {
+                                  cellValue = propValue[column.key];
+                                  break;
+                                }
                               }
                             }
                           }
                         }
-                      }
-                      
-                      return (
-                        <td 
-                          key={column.key} 
-                          className={`${styles.cell} ${styles[`${column.type}Cell`] || ''}`}
-                          data-label={column.label}
-                        >
-                          {formatCellValue(cellValue, column.type)}
-                        </td>
-                      );
-                    })}
-                  </tr>
+                        
+                        return (
+                          <td 
+                            key={column.key} 
+                            className={`${styles.cell} ${styles[`${column.type}Cell`] || ''}`}
+                            data-label={column.label}
+                          >
+                            <div className={styles.cellContent}>
+                              <div className={styles.cellValue}>
+                                {formatCellValue(cellValue, column.type)}
+                                {/* NEW: Add duplicate badge to first column */}
+                                {colIndex === 0 && renderDuplicateBadge(item)}
+                              </div>
+                              {/* NEW: Add expand button to last column */}
+                              {colIndex === columns.length - 1 && renderExpandButton(item)}
+                            </div>
+                          </td>
+                        );
+                      })}
+                    </tr>
+                    {/* NEW: Render duplicate rows if expanded */}
+                    {renderDuplicateRows(item)}
+                  </React.Fragment>
                 );
               })}
             </tbody>
@@ -622,8 +842,8 @@ export default function StreamingResultsTable({ websetId }) {
         </div>
       )}
       
-      {/* Rejected Items Section */}
-      {showRejected && rejectedItems.length > 0 && (
+      {/* Rejected Items Section - Only show when clustering is disabled */}
+      {!clusteringEnabled && showRejected && rejectedItems.length > 0 && (
         <div className={styles.rejectedSection}>
           <h3 className={styles.rejectedTitle}>
             🚫 Rejected Items ({rejectedItems.length})
