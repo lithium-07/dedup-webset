@@ -21,11 +21,24 @@ export default function StreamingResultsTable({ websetId, historicalData }) {
   const [duplicateMap, setDuplicateMap] = useState({});
   
   const [showSemanticSearch, setShowSemanticSearch] = useState(false);
-
   
+  // Semantic Clustering state
+  const [showClusteringModal, setShowClusteringModal] = useState(false);
+  const [clusteringQuery, setClusteringQuery] = useState('');
+  const [clusters, setClusters] = useState([]);
+  const [isClusteringLoading, setIsClusteringLoading] = useState(false);
+  const [clusteringError, setClusteringError] = useState(null);
+  // Remove viewMode - we'll just reorder the same table
+  const [isClusteringActive, setIsClusteringActive] = useState(false);
+  const [activeClusteringQuery, setActiveClusteringQuery] = useState(''); // Track the query used for current clustering
+  const [originalItems, setOriginalItems] = useState([]); // Preserve original order for reset
+  const [clusteringProgress, setClusteringProgress] = useState({ step: 0, message: '', percentage: 0 });
+  const [clusterColors] = useState(['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4', '#84cc16', '#f97316']);
+
   const eventSourceRef = useRef(null);
   const { enqueueSnackbar } = useSnackbar();
 
+  // CORE FUNCTIONALITY: SSE Streaming
   useEffect(() => {
     // If we have historical data, use it instead of connecting to SSE
     if (historicalData) {
@@ -45,7 +58,6 @@ export default function StreamingResultsTable({ websetId, historicalData }) {
     setRejectedItems([]);
     setColumns([]);
     setSortConfig({ key: null, direction: null });
-
 
     // Create EventSource for streaming
     const eventSource = new EventSource(`http://localhost:3000/api/websets/${websetId}/stream`);
@@ -73,12 +85,6 @@ export default function StreamingResultsTable({ websetId, historicalData }) {
             
           case 'item':
             console.log('Received item:', JSON.stringify(data.item, null, 2));
-            console.log('Properties:', JSON.stringify(data.item.properties, null, 2));
-            if (data.item.properties) {
-              const firstKey = Object.keys(data.item.properties)[0];
-              console.log('Type:', firstKey);
-              console.log('Nested data:', JSON.stringify(data.item.properties[firstKey], null, 2));
-            }
             setItems(prev => {
               // Check if item already exists to avoid duplicates
               const exists = prev.some(item => item.id === data.item.id);
@@ -139,6 +145,13 @@ export default function StreamingResultsTable({ websetId, historicalData }) {
           case 'confirm':
             // Replace pending item with confirmed data
             console.log('Confirming item:', JSON.stringify(data.data, null, 2));
+            
+            // Safety check for data.data
+            if (!data.data || !data.data.id) {
+              console.warn('Invalid confirm data received:', data);
+              break;
+            }
+            
             setItems(prev => {
               const updated = prev.map(item => 
                 item._pending && item.id === data.data.id 
@@ -167,12 +180,12 @@ export default function StreamingResultsTable({ websetId, historicalData }) {
             enqueueSnackbar(`Item rejected: ${data.details}`, { variant: 'warning' });
             break;
         }
-              } catch (err) {
-          console.error('Error parsing SSE data:', err);
-          const errorMsg = 'Error parsing server response';
-          setError(errorMsg);
-          enqueueSnackbar(errorMsg, { variant: 'error' });
-        }
+      } catch (err) {
+        console.error('Error parsing SSE data:', err);
+        const errorMsg = 'Error parsing server response';
+        setError(errorMsg);
+        enqueueSnackbar(errorMsg, { variant: 'error' });
+      }
     };
 
     eventSource.onerror = (err) => {
@@ -191,6 +204,7 @@ export default function StreamingResultsTable({ websetId, historicalData }) {
     };
   }, [websetId, historicalData]);
 
+  // ESSENTIAL UTILITY FUNCTIONS
   const formatDate = (dateString) => {
     if (!dateString) return 'Just now';
     return new Date(dateString).toLocaleString();
@@ -200,8 +214,6 @@ export default function StreamingResultsTable({ websetId, historicalData }) {
     if (!text) return '';
     return text.length > maxLength ? text.substring(0, maxLength) + '...' : text;
   };
-
-
 
   // Function to update columns based on items properties data
   const updateColumns = (items) => {
@@ -262,7 +274,249 @@ export default function StreamingResultsTable({ websetId, historicalData }) {
     setColumns(columnList);
   };
 
-  // Format column labels to be more readable
+  const updateClusteringProgress = (step, message, percentage) => {
+    setClusteringProgress({ step, message, percentage });
+  };
+
+  const getEstimatedDuration = (itemCount) => {
+    // Estimate duration based on item count
+    if (itemCount <= 10) return 'a few seconds';
+    if (itemCount <= 50) return '10-15 seconds';
+    if (itemCount <= 100) return '20-30 seconds';
+    return '30-60 seconds';
+  };
+
+  const handleClusterItems = async () => {
+    if (!clusteringQuery.trim()) {
+      setClusteringError('Please enter a clustering query');
+      return;
+    }
+
+    setIsClusteringLoading(true);
+    setClusteringError(null);
+    
+    const itemCount = items.length;
+    const estimatedTime = getEstimatedDuration(itemCount);
+    
+    try {
+      // Step 1: Initial analysis
+      updateClusteringProgress(1, `Analyzing ${itemCount} items... (estimated ${estimatedTime})`, 10);
+      await new Promise(resolve => setTimeout(resolve, 500)); // Brief pause for UX
+      
+      // Step 2: Detect entity type
+      updateClusteringProgress(2, 'Detecting entity type and extracting fields...', 25);
+      const entityType = detectEntityType(items.slice(0, 5));
+      await new Promise(resolve => setTimeout(resolve, 300));
+      
+      // Step 3: Prepare request
+      updateClusteringProgress(3, 'Preparing data for AI processing...', 35);
+      const requestData = {
+        webset_id: websetId,
+        items: items.map(item => item.properties || {}),
+        query: clusteringQuery,
+        entity_type: entityType
+      };
+      await new Promise(resolve => setTimeout(resolve, 200));
+      
+      // Step 4: Send to clustering service
+      updateClusteringProgress(4, `Processing with AI (${entityType} clustering)...`, 45);
+      
+      const response = await fetch('http://localhost:8003/cluster', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(requestData),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Clustering service returned ${response.status}: ${response.statusText}`);
+      }
+
+      // Step 5: Parse response
+      updateClusteringProgress(5, 'Processing clustering results...', 75);
+      const result = await response.json();
+      
+      // Preserve original items order before clustering
+      if (!isClusteringActive) {
+        setOriginalItems([...items]);
+      }
+      
+      // Step 6: Match and organize clusters
+      updateClusteringProgress(6, 'Organizing clusters and matching items...', 85);
+      
+      // Process clusters and assign cluster info to items
+      const clusteredItems = [];
+      const clusterInfo = [];
+      
+      result.clusters.forEach((cluster, clusterIndex) => {
+        const clusterColor = clusterColors[clusterIndex % clusterColors.length];
+        
+        cluster.items.forEach((clusterItem, itemIndex) => {
+          // Find the original item that matches this clustered item
+          const originalItem = items.find(item => {
+            // Try to match by multiple criteria
+            const props = item.properties || {};
+            return (
+              // Match by name/title
+              (props.name === clusterItem.name) ||
+              (props.title === clusterItem.title) ||
+              (props.company?.name === clusterItem.name) ||
+              (props.book?.title === clusterItem.title) ||
+              (props.movie?.title === clusterItem.title) ||
+              // Match by URL if available
+              (props.url === clusterItem.url) ||
+              // Match by any nested property containing the name
+              JSON.stringify(props).includes(clusterItem.name || clusterItem.title || '') ||
+              // Fallback: try to match by description/content similarity
+              (clusterItem.description && props.description === clusterItem.description)
+            );
+          });
+          
+          if (originalItem) {
+            clusteredItems.push({
+              ...originalItem,
+              _cluster: {
+                id: clusterIndex,
+                name: cluster.name,
+                reasoning: cluster.reasoning,
+                color: clusterColor,
+                position: itemIndex + 1,
+                total: cluster.count
+              }
+            });
+          } else {
+            console.warn('Could not match clustered item back to original:', clusterItem);
+          }
+        });
+        
+        clusterInfo.push({
+          ...cluster,
+          color: clusterColor
+        });
+      });
+      
+      // Step 7: Final organization
+      updateClusteringProgress(7, 'Reordering table...', 95);
+      
+      // Add items that weren't clustered (if any) at the end
+      const clusteredItemIds = new Set(clusteredItems.map(item => item.id));
+      const unclusteredItems = items.filter(item => !clusteredItemIds.has(item.id));
+      
+      if (unclusteredItems.length > 0) {
+        console.log(`${unclusteredItems.length} items could not be clustered and will appear at the end`);
+      }
+      
+      setClusters(clusterInfo);
+      // Update the items array with clustered items + unclustered items
+      setItems([...clusteredItems, ...unclusteredItems]);
+      setIsClusteringActive(true);
+      setShowClusteringModal(false);
+      setActiveClusteringQuery(clusteringQuery); // Save the query before clearing
+      setClusteringQuery(''); // Clear input for next use
+      
+      // Step 8: Complete
+      updateClusteringProgress(8, 'Clustering complete!', 100);
+      
+      // Save query to history
+      try {
+        await fetch('http://localhost:3000/api/query-history', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            websetId,
+            queryType: 'clustering',
+            queryText: clusteringQuery,
+            entityType,
+            resultsMetadata: {
+              itemsProcessed: clusteredItems.length,
+              clustersFound: result.clusters.length,
+              processingTimeMs: result.processing_time_ms || 0
+            },
+            resultsSummary: `Created ${result.clusters.length} clusters from ${clusteredItems.length} items`
+          })
+        });
+        console.log('📝 Clustering query saved to history');
+      } catch (historyError) {
+        console.warn('Failed to save clustering query to history:', historyError);
+        // Don't fail the main operation if history saving fails
+      }
+      
+      enqueueSnackbar(
+        `Successfully clustered ${clusteredItems.length} items into ${result.clusters.length} groups`, 
+        { variant: 'success' }
+      );
+      
+    } catch (error) {
+      console.error('Clustering error:', error);
+      setClusteringError(error.message);
+      enqueueSnackbar(`Clustering failed: ${error.message}`, { variant: 'error' });
+    } finally {
+      setIsClusteringLoading(false);
+      setClusteringProgress({ step: 0, message: '', percentage: 0 });
+    }
+  };
+
+  const detectEntityType = (items) => {
+    if (!items || items.length === 0) return 'unknown';
+    
+    // Analyze first few items to detect type
+    const sample = items.slice(0, Math.min(5, items.length));
+    const fieldCounts = {};
+    
+    sample.forEach(item => {
+      if (item.properties) {
+        Object.keys(item.properties).forEach(key => {
+          const nestedProps = item.properties[key];
+          if (typeof nestedProps === 'object' && nestedProps !== null) {
+            Object.keys(nestedProps).forEach(nestedKey => {
+              fieldCounts[nestedKey.toLowerCase()] = (fieldCounts[nestedKey.toLowerCase()] || 0) + 1;
+            });
+          }
+          fieldCounts[key.toLowerCase()] = (fieldCounts[key.toLowerCase()] || 0) + 1;
+        });
+      }
+    });
+    
+    // Check for movie indicators
+    const movieFields = ['director', 'genre', 'cast', 'runtime', 'imdb'];
+    if (movieFields.some(field => fieldCounts[field])) {
+      return 'movie';
+    }
+    
+    // Check for company indicators
+    const companyFields = ['industry', 'employees', 'revenue', 'headquarters'];
+    if (companyFields.some(field => fieldCounts[field])) {
+      return 'company';
+    }
+    
+    return 'movie'; // Default fallback
+  };
+
+  const resetClustering = () => {
+    // Restore original items order
+    if (originalItems.length > 0) {
+      setItems([...originalItems]);
+    } else {
+      // Fallback: remove cluster info from current items
+      const cleanedItems = items.map(item => {
+        const { _cluster, ...originalItem } = item;
+        return originalItem;
+      });
+      setItems(cleanedItems);
+    }
+    
+    setClusters([]);
+    setIsClusteringActive(false);
+    setClusteringQuery('');
+    setClusteringError(null);
+    setActiveClusteringQuery('');
+    setOriginalItems([]); // Clear preserved items
+    enqueueSnackbar('Clustering cleared - table restored to original order', { variant: 'info' });
+  };
+
   const formatColumnLabel = (key) => {
     return key
       .replace(/_/g, ' ')
@@ -717,6 +971,28 @@ export default function StreamingResultsTable({ websetId, historicalData }) {
           </div>
         )}
 
+        {/* Semantic Clustering Controls */}
+        <div className={styles.clusteringControls}>
+          <button
+            onClick={() => setShowClusteringModal(true)}
+            className={styles.clusterButton}
+            disabled={items.length === 0 || status === 'processing'}
+            title="Cluster items semantically"
+          >
+            🎯 Semantic Clustering
+          </button>
+          
+          {isClusteringActive && (
+            <button
+              onClick={resetClustering}
+              className={styles.resetButton}
+              title="Return to table view"
+            >
+              📋 Table View
+            </button>
+          )}
+        </div>
+
 
       </div>
 
@@ -726,11 +1002,143 @@ export default function StreamingResultsTable({ websetId, historicalData }) {
         </div>
       )}
 
+      {/* Clustering Modal */}
+      {showClusteringModal && (
+        <div className={styles.modal}>
+          <div className={styles.modalContent}>
+            <div className={styles.modalHeader}>
+              <h3>🎯 Semantic Clustering</h3>
+              <button 
+                onClick={() => setShowClusteringModal(false)}
+                className={styles.closeButton}
+              >
+                ×
+              </button>
+            </div>
+            
+            <div className={styles.modalBody}>
+              <p>How would you like to cluster these {items.length} items?</p>
+              
+              <textarea
+                value={clusteringQuery}
+                onChange={(e) => setClusteringQuery(e.target.value)}
+                placeholder="Example: 'group movies by same director' or 'cluster companies in similar industries'"
+                className={styles.clusteringInput}
+                rows={3}
+              />
+              
+              <div className={styles.exampleQueries}>
+                <p><strong>Example queries:</strong></p>
+                <div className={styles.examples}>
+                  <button onClick={() => setClusteringQuery('group by director')}>group by director</button>
+                  <button onClick={() => setClusteringQuery('same genre')}>same genre</button>
+                  <button onClick={() => setClusteringQuery('cluster by decade')}>cluster by decade</button>
+                  <button onClick={() => setClusteringQuery('same industry')}>same industry</button>
+                </div>
+              </div>
+              
+              {clusteringError && (
+                <div className={styles.error}>
+                  {clusteringError}
+                </div>
+              )}
+              
+              {/* Progress Loader */}
+              {isClusteringLoading && (
+                <div className={styles.progressContainer}>
+                  <div className={styles.progressHeader}>
+                    <span className={styles.progressTitle}>
+                      Step {clusteringProgress.step}/8: {clusteringProgress.message}
+                    </span>
+                  </div>
+                  <div className={styles.progressBarContainer}>
+                    <div 
+                      className={styles.progressBar}
+                      style={{ width: `${clusteringProgress.percentage}%` }}
+                    />
+                  </div>
+                  <div className={styles.progressPercentage}>
+                    {clusteringProgress.percentage}%
+                  </div>
+                  <div className={styles.progressSteps}>
+                    {[
+                      'Analyzing items',
+                      'Detecting entity type', 
+                      'Preparing data',
+                      'AI processing',
+                      'Processing results',
+                      'Organizing clusters',
+                      'Reordering table',
+                      'Complete'
+                    ].map((stepName, index) => (
+                      <div 
+                        key={index}
+                        className={`${styles.progressStep} ${
+                          index + 1 <= clusteringProgress.step ? styles.progressStepComplete : 
+                          index + 1 === clusteringProgress.step ? styles.progressStepActive : 
+                          styles.progressStepPending
+                        }`}
+                      >
+                        <div className={styles.progressStepNumber}>{index + 1}</div>
+                        <div className={styles.progressStepName}>{stepName}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+            
+            <div className={styles.modalFooter}>
+              <button 
+                onClick={() => setShowClusteringModal(false)}
+                className={styles.cancelButton}
+              >
+                Cancel
+              </button>
+              <button 
+                onClick={handleClusterItems}
+                className={styles.clusterButton}
+                disabled={isClusteringLoading || !clusteringQuery.trim()}
+              >
+                {isClusteringLoading ? '🔄 Clustering...' : '🎯 Cluster Items'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Show either semantic search or table view */}
       {showSemanticSearch ? (
         <SemanticSearch websetId={websetId} items={items} />
       ) : (
         <div>
+          {/* Cluster Summary - Show when clustering is active */}
+          {isClusteringActive && clusters.length > 0 && (
+            <div className={styles.clusterSummary}>
+              <div className={styles.clusterSummaryHeader}>
+                <h4 className={styles.clusterSummaryTitle}>
+                  📊 Semantic Clustering Active - Table Reordered by: "{activeClusteringQuery || 'No Query'}" 
+                </h4>
+                <button onClick={resetClustering} className={styles.resetClusteringButton}>
+                  ↺ Reset Order
+                </button>
+              </div>
+              <div className={styles.clustersList}>
+                {clusters.map((cluster, index) => (
+                  <div key={index} className={styles.clusterSummaryItem}>
+                    <div 
+                      className={styles.clusterColorIndicator} 
+                      style={{ backgroundColor: cluster.color }}
+                    />
+                    <span className={styles.clusterSummaryText}>
+                      <strong>{cluster.name}</strong> ({cluster.count} items)
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           {items.length === 0 && !error ? (
             status === 'processing' || status === 'processing_items' || status === 'connecting' ? (
               // Show skeleton table while streaming
@@ -860,21 +1268,28 @@ export default function StreamingResultsTable({ websetId, historicalData }) {
                                 key={column.key} 
                                 className={`${styles.cell} ${styles[`${column.type}Cell`] || ''}`}
                                 data-label={column.label}
+                                style={item._cluster && colIndex === 0 ? { borderLeft: `4px solid ${item._cluster.color}` } : {}}
                               >
                                 <div className={styles.cellContent}>
                                   <div className={styles.cellValue}>
                                     {formatCellValue(cellValue, column.type)}
-                                    {/* NEW: Add duplicate badge to first column */}
+                                    {/* Add cluster badge to first column when clustering is active */}
+                                    {colIndex === 0 && item._cluster && (
+                                      <div className={styles.clusterBadge} style={{ backgroundColor: item._cluster.color }}>
+                                        {item._cluster.name} ({item._cluster.position}/{item._cluster.total})
+                                      </div>
+                                    )}
+                                    {/* Keep existing duplicate badge */}
                                     {colIndex === 0 && renderDuplicateBadge(item)}
                                   </div>
-                                  {/* NEW: Add expand button to last column */}
+                                  {/* Add expand button to last column */}
                                   {colIndex === columns.length - 1 && renderExpandButton(item)}
                                 </div>
                               </td>
                             );
                           })}
                         </tr>
-                        {/* NEW: Render duplicate rows if expanded */}
+                        {/* Render duplicate rows if expanded */}
                         {renderDuplicateRows(item)}
                       </React.Fragment>
                     );

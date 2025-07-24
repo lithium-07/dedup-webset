@@ -5,6 +5,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import Bottleneck             from 'bottleneck';
 import { vecAdd, vecQuery } from './vectorClient.js';
 import fetch from 'node-fetch'; // For URL resolution
+import crypto                 from 'crypto'; // For UUID generation
 import Webset from '../models/Webset.js';
 import Item from '../models/Item.js';
 
@@ -55,6 +56,7 @@ export class DedupService {
     this.isProcessing = false;
     this.processedTitles = new Map(); // Entity normalized titles -> item info
     this.processedUrls = new Set(); // Entity exact URLs
+    this.exactNames = new Map(); // Entity exact names/titles -> item info (LAYER 0 - perfect matches)
     // Track processed items by ID to prevent duplicates
     this.processedIds = new Set(); // Track all processed item IDs
   }
@@ -107,14 +109,22 @@ export class DedupService {
     
     try {
       while (this.processingQueue.length > 0) {
-        const { websetId, item, resolve, reject } = this.processingQueue.shift();
+        const queueItem = this.processingQueue.shift();
+        
+        // Safety check for queue item structure
+        if (!queueItem || !queueItem.websetId || !queueItem.item) {
+          console.warn('⚠️ DEDUP: Invalid queue item structure:', queueItem);
+          continue;
+        }
+        
+        const { websetId, item, resolve, reject } = queueItem;
         
         try {
           await this._processItemSequentially(websetId, item);
-          resolve();
+          if (resolve) resolve();
         } catch (error) {
           console.error(`❌ DEDUP: Processing error for item ${item?.id || 'unknown'}:`, error);
-          reject(error);
+          if (reject) reject(error);
           // Don't break the queue processing on individual item errors
         }
       }
@@ -145,6 +155,23 @@ export class DedupService {
 
     // BULLETPROOF LAYERS: Only for entities
     if (this.entityType) {
+      // BULLETPROOF LAYER 0: Exact name/title duplicate check (fastest - before any normalization)
+      const exactNames = this._extractExactNames(row.raw);
+      for (const exactName of exactNames) {
+        if (exactName && this.exactNames.has(exactName)) {
+          const existing = this.exactNames.get(exactName);
+          console.log(`❌ DEDUP: BULLETPROOF Layer 0 - Exact name duplicate: "${exactName}"`);
+          await this._broadcastRejection(
+            websetId,
+            row.raw,
+            'exact_name_duplicate',
+            `Exact name/title already processed: "${exactName}" (existing: ${existing.name})`,
+            existing.raw
+          );
+          return;
+        }
+      }
+
       // BULLETPROOF LAYER 1: Exact URL duplicate check (fastest)
       if (row.url && this.processedUrls.has(row.url)) {
         console.log(`❌ DEDUP: BULLETPROOF Layer 1 - Exact URL duplicate: ${row.url}`);
@@ -267,8 +294,11 @@ export class DedupService {
           console.warn('⚠️ DEDUP: Invalid vector search results for name:', nameHits);
         } else {
           for (const id of nameHits) {
-            if (this.table.has(id)) {
-              candidatePool.add(this.table.get(id));
+            if (id && this.table.has(id)) {
+              const candidate = this.table.get(id);
+              if (candidate && candidate.name) { // Ensure candidate is valid
+                candidatePool.add(candidate);
+              }
             }
           }
         }
@@ -280,8 +310,11 @@ export class DedupService {
             console.warn('⚠️ DEDUP: Invalid vector search results for URL:', urlHits);
           } else {
             for (const id of urlHits) {
-              if (this.table.has(id)) {
-                candidatePool.add(this.table.get(id));
+              if (id && this.table.has(id)) {
+                const candidate = this.table.get(id);
+                if (candidate && candidate.name) { // Ensure candidate is valid
+                  candidatePool.add(candidate);
+                }
               }
             }
           }
@@ -294,8 +327,11 @@ export class DedupService {
             console.warn('⚠️ DEDUP: Invalid vector search results for domain:', domainHits);
           } else {
             for (const id of domainHits) {
-              if (this.table.has(id)) {
-                candidatePool.add(this.table.get(id));
+              if (id && this.table.has(id)) {
+                const candidate = this.table.get(id);
+                if (candidate && candidate.name) { // Ensure candidate is valid
+                  candidatePool.add(candidate);
+                }
               }
             }
           }
@@ -531,6 +567,38 @@ export class DedupService {
     return bestTitle ? this._cleanText(bestTitle) : '';
   }
 
+  // BULLETPROOF LAYER 0: Extract exact names/titles for perfect match detection (no cleaning/normalization)
+  _extractExactNames(item) {
+    if (!item) return [];
+    
+    const exactNames = new Set(); // Use Set to avoid duplicates
+    
+    // Extract from all possible name/title locations
+    const nameCandidates = [
+      item.name,
+      item.title,
+      item.properties?.name,
+      item.properties?.title,
+      // Check nested objects for name/title fields
+      ...(item.properties ? Object.values(item.properties)
+        .filter(val => val && typeof val === 'object' && !Array.isArray(val))
+        .flatMap(obj => [obj.name, obj.title])
+        .filter(Boolean) : [])
+    ];
+    
+    // Add all valid, non-empty names/titles (no cleaning - exact match only)
+    nameCandidates.forEach(candidate => {
+      if (candidate && typeof candidate === 'string') {
+        const trimmed = candidate.trim();
+        if (trimmed.length > 0) {
+          exactNames.add(trimmed);
+        }
+      }
+    });
+    
+    return Array.from(exactNames);
+  }
+
   // IMPROVEMENT 7: Normalize entity titles for better duplicate detection
   _normalizeEntityTitle(title) {
     if (!title || typeof title !== 'string') return '';
@@ -553,7 +621,7 @@ export class DedupService {
       // Remove edition markers: Remastered, Director's Cut, Extended, Revised
       .replace(/\s*\b(?:Remastered|Director's\s*Cut|Extended|Revised|Special|Limited|Ultimate|Complete|Definitive)\s*(?:Edition|Version|Cut)?\b/gi, '')
       // BULLETPROOF: Remove trailer/promo content and everything after it  
-      .replace(/\s*(?:(?:Official|Original|Classic|Theatrical)\s+)?(?:Movie\s+)?(?:Trailer|Teaser)(?:\s*[#\d]+)?.*$/gi, '')
+      .replace(/\s*(?:(?:Official|Original|Classic|Theatrical)\s+)*(?:Movie\s+)?(?:Trailer|Teaser)(?:\s*[#\d]+)?.*$/gi, '')
       .replace(/\s*(?:Official\s+)?(?:English\s+)?(?:Dubbed\s+)?(?:Subtitled\s+)?(?:Final\s+)?(?:International\s+)?(?:Red\s*Band\s+)?(?:Exclusive\s+)?(?:New\s+)?(?:Trailer|Teaser).*$/gi, '')
       .replace(/\s*[\-:\|\(\[\{]*\s*TV\s*Spot(?:\s*[#\d]+)?.*$/gi, '')
       .replace(/\s*[\-:\|\(\[\{]*\s*(?:Official\s*)?(?:Movie\s*)?Clip(?:\s*[#\d]+)?.*$/gi, '')
@@ -873,7 +941,17 @@ ${JSON.stringify({
 
     const prompt = this._buildLLMPrompt(batch);
     
-    console.log(`🧠 DEDUP: Sending ${batch.length} pairs to LLM:`, batch.map(p => `${p.nameA} vs ${p.nameB}`));
+    // Safe logging for different batch types
+    const batchSummary = batch.map(p => {
+      if (p.type === 'entity_decision') {
+        return `${p.nameNew || 'unknown'} (entity)`;
+      } else if (p.type === 'company_decision') {
+        return `${p.nameNew || 'unknown'} (company)`;
+      } else {
+        return `${p.nameA || 'unknown'} vs ${p.nameB || 'unknown'}`;
+      }
+    });
+    console.log(`🧠 DEDUP: Sending ${batch.length} items to LLM:`, batchSummary);
 
     let resp;
     try {
@@ -934,7 +1012,8 @@ ${JSON.stringify({
     }
 
     // Process verdicts sequentially to ensure proper async handling
-    for (let i = 0; i < verdicts.length; i++) {
+    const maxIndex = Math.min(verdicts.length, batch.length);
+    for (let i = 0; i < maxIndex; i++) {
       const verdict = verdicts[i];
       // Handle different verdict formats safely
       const same = Array.isArray(verdict) ? verdict[0] : verdict;
@@ -953,11 +1032,23 @@ ${JSON.stringify({
       await this._confirmPending(p, same);
     }
     
+    // Handle any remaining batch items if verdicts were shorter than expected
+    if (batch.length > verdicts.length) {
+      console.warn(`⚠️ DEDUP: Verdict count mismatch - batch: ${batch.length}, verdicts: ${verdicts.length}. Treating remaining items as unique.`);
+      for (let i = verdicts.length; i < batch.length; i++) {
+        const p = batch[i];
+        if (p) {
+          console.log(`⚠️ DEDUP: Processing remaining item ${i} as unique: ${p.nameNew || p.nameA || 'unknown'}`);
+          await this._confirmPending(p, false);
+        }
+      }
+    }
+    
     console.log(`🧠 DEDUP: Batch processing complete (${Date.now() - flushStartTime}ms total)`);
   }
 
   async _confirmPending(p, same) {
-    // Handle both entity decisions and legacy pairs
+    // Handle entity decisions, company decisions, and legacy pairs
     if (p.type === 'entity_decision') {
       // New entity decision format
       if (same) {
@@ -979,7 +1070,63 @@ ${JSON.stringify({
         } else {
           this._accept(entityCanon, p.websetId);
         }
-        this.broadcast(p.websetId, { type: 'confirm', data: p.rawNew });
+        
+        // Safety check: ensure we have valid data to broadcast
+        if (!p.rawNew || !p.rawNew.id) {
+          console.warn('⚠️ DEDUP: rawNew is invalid, reconstructing for broadcast:', { 
+            hasRawNew: !!p.rawNew, 
+            rawNewId: p.rawNew?.id,
+            idNew: p.idNew,
+            nameNew: p.nameNew 
+          });
+          const reconstructedData = {
+            id: p.idNew,
+            name: p.nameNew,
+            url: p.urlNew,
+            properties: p.rawNew?.properties || {}
+          };
+          this.broadcast(p.websetId, { type: 'confirm', data: reconstructedData });
+        } else {
+          this.broadcast(p.websetId, { type: 'confirm', data: p.rawNew });
+        }
+        this.pending.delete(p.idNew);
+      }
+    } else if (p.type === 'company_decision') {
+      // Company decision format (similar to entity but for companies)
+      if (same) {
+        // drop company - broadcast as rejected  
+        await this._broadcastRejection(
+          p.websetId,
+          p.rawNew,
+          'llm_duplicate',
+          `LLM determined company duplicate`,
+          null
+        );
+        this.broadcast(p.websetId, { type: 'drop', tmpId: p.idNew });
+        this.pending.delete(p.idNew);
+      } else {
+        // accept company
+        const companyCanon = this._canonItem({ ...p.rawNew, url: p.urlNew, name: p.nameNew });
+        await this._accept(companyCanon, p.websetId);
+        
+        // Safety check: ensure we have valid data to broadcast
+        if (!p.rawNew || !p.rawNew.id) {
+          console.warn('⚠️ DEDUP: rawNew is invalid for company, reconstructing for broadcast:', { 
+            hasRawNew: !!p.rawNew, 
+            rawNewId: p.rawNew?.id,
+            idNew: p.idNew,
+            nameNew: p.nameNew 
+          });
+          const reconstructedData = {
+            id: p.idNew,
+            name: p.nameNew,
+            url: p.urlNew,
+            properties: p.rawNew?.properties || {}
+          };
+          this.broadcast(p.websetId, { type: 'confirm', data: reconstructedData });
+        } else {
+          this.broadcast(p.websetId, { type: 'confirm', data: p.rawNew });
+        }
         this.pending.delete(p.idNew);
       }
     } else {
@@ -1006,7 +1153,25 @@ ${JSON.stringify({
         } else {
           await this._accept(aCanon, p.websetId, true); // Skip broadcast here
         }
-        this.broadcast(p.websetId, { type: 'confirm', data: p.rawA }); // Only broadcast once
+        
+        // Safety check: ensure we have valid data to broadcast
+        if (!p.rawA || !p.rawA.id) {
+          console.warn('⚠️ DEDUP: rawA is invalid, reconstructing for broadcast:', { 
+            hasRawA: !!p.rawA, 
+            rawAId: p.rawA?.id,
+            idA: p.idA,
+            nameA: p.nameA 
+          });
+          const reconstructedData = {
+            id: p.idA,
+            name: p.nameA,
+            url: p.urlA,
+            properties: p.rawA?.properties || {}
+          };
+          this.broadcast(p.websetId, { type: 'confirm', data: reconstructedData });
+        } else {
+          this.broadcast(p.websetId, { type: 'confirm', data: p.rawA }); // Only broadcast once
+        }
         this.pending.delete(p.idA);
       }
     }
@@ -1025,6 +1190,18 @@ ${JSON.stringify({
         this.processedUrls.add(row.url);
       }
       
+      // BULLETPROOF LAYER 0: Store exact names/titles for perfect match detection
+      const exactNames = this._extractExactNames(row.raw);
+      exactNames.forEach(exactName => {
+        if (exactName) {
+          this.exactNames.set(exactName, {
+            name: row.name,
+            url: row.url,
+            raw: row.raw
+          });
+        }
+      });
+      
       // FIXED: Compute normalized title once and reuse
       const normalizedTitle = row.name ? this._normalizeEntityTitle(row.name) : '';
       
@@ -1038,21 +1215,31 @@ ${JSON.stringify({
 
       // BULLETPROOF: Await vector storage for entities to ensure synchronization
       console.log(`🔍 DEDUP: Storing entity with normalized title: "${normalizedTitle}"`);
-      if (normalizedTitle) {
-        await vecAdd(row.rowId, normalizedTitle);
-      }
-      
-      // Also store URL as fallback if it differs significantly from name
-      if (row.url && row.url !== row.name) {
-        await vecAdd(row.rowId, row.url);
+      try {
+        if (normalizedTitle) {
+          await vecAdd(row.rowId, normalizedTitle);
+        }
+        
+        // Also store URL as fallback if it differs significantly from name
+        if (row.url && row.url !== row.name) {
+          await vecAdd(row.rowId, row.url);
+        }
+      } catch (vecError) {
+        console.warn(`⚠️ DEDUP: Vector storage failed for ${row.rowId}:`, vecError.message);
+        // Continue processing even if vector storage fails
       }
       
       console.log(`✅ DEDUP: BULLETPROOF ENTITY ACCEPTED ${row.rowId} (${row.name}) - synchronized`);
     } else {
-      // Companies: Keep original fire-and-forget approach (no await)
-      vecAdd(row.rowId, row.name || row.url);
-      if (row.url && row.url !== row.name) {
-        vecAdd(row.rowId, row.url);
+      // Companies: Keep original fire-and-forget approach (no await) but add error handling
+      try {
+        vecAdd(row.rowId, row.name || row.url);
+        if (row.url && row.url !== row.name) {
+          vecAdd(row.rowId, row.url);
+        }
+      } catch (vecError) {
+        console.warn(`⚠️ DEDUP: Vector storage failed for company ${row.rowId}:`, vecError.message);
+        // Continue processing even if vector storage fails
       }
       
       console.log(`✅ DEDUP: COMPANY ACCEPTED ${row.rowId} (${row.name}) - original flow`);
@@ -1247,11 +1434,12 @@ ${JSON.stringify({
           
           console.log(`✅ DEDUP: URL resolved ${url} → ${resolvedUrl}`);
           
-          // Limit cache size to prevent memory issues
-          if (globalThis.urlResolutionCache.size > 2000) {
-            const firstKey = globalThis.urlResolutionCache.keys().next().value;
-            globalThis.urlResolutionCache.delete(firstKey);
-            console.log(`🧹 DEDUP: URL cache cleanup, size now ${globalThis.urlResolutionCache.size}`);
+          // Limit cache size to prevent memory issues (more aggressive cleanup)
+          if (globalThis.urlResolutionCache.size > 1000) {
+            // Remove oldest 20% of entries
+            const keysToDelete = Array.from(globalThis.urlResolutionCache.keys()).slice(0, 200);
+            keysToDelete.forEach(key => globalThis.urlResolutionCache.delete(key));
+            console.log(`🧹 DEDUP: URL cache cleanup, removed ${keysToDelete.length} entries, size now ${globalThis.urlResolutionCache.size}`);
           }
           
           return resolvedUrl;
@@ -1475,13 +1663,15 @@ ${JSON.stringify({
   // FIXED: Add cleanup method to prevent memory leaks
   clearBulletproofCache() {
     if (this.entityType) {
+      const exactNameCount = this.exactNames.size;
       const titleCount = this.processedTitles.size;
       const urlCount = this.processedUrls.size;
       
+      this.exactNames.clear();
       this.processedTitles.clear();
       this.processedUrls.clear();
       
-      console.log(`🧹 DEDUP: Cleared bulletproof cache - ${titleCount} titles, ${urlCount} URLs`);
+      console.log(`🧹 DEDUP: Cleared bulletproof cache - ${exactNameCount} exact names, ${titleCount} titles, ${urlCount} URLs`);
     }
   }
 

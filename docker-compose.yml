@@ -54,6 +54,19 @@ services:
     volumes:
       - semantic_data:/data
 
+  clustering-service:
+    build:
+      context: ./clustering-service
+      dockerfile: Dockerfile
+    container_name: exa_dedupe_clustering
+    restart: unless-stopped
+    ports:
+      - "8003:8003"  # Clustering service
+    environment:
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+    depends_on:
+      - mongodb
+
 volumes:
   mongodb_data:
     driver: local

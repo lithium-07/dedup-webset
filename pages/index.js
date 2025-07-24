@@ -100,8 +100,9 @@ export default function Home() {
         <WebsetQueryForm onSubmit={handleQuerySubmit} isLoading={isLoading} />
       ) : (
         <>
+        <h2> Query: {searchQuery || 'Loading...'}</h2>
           <div className={styles.header}>
-            <h2>{searchQuery || 'Loading...'}</h2>
+            
             <button onClick={handleNewQuery} className={styles.newQueryButton}>
               New Query
             </button>

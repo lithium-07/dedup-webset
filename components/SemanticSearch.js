@@ -75,6 +75,35 @@ export default function SemanticSearch({ websetId, items }) {
 
       const data = await response.json();
       setSearchResults(data);
+
+      // Save query to history
+      try {
+        await fetch('http://localhost:3000/api/query-history', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            websetId,
+            queryType: 'semantic_search',
+            queryText: query.trim(),
+            entityType: 'unknown', // Could be improved by detecting from items
+            resultsMetadata: {
+              itemsProcessed: items.length,
+              relevantItems: data.relevant_items?.length || 0,
+              confidence: data.analysis?.confidence || 0,
+              processingTimeMs: 0 // Could track this if we measure it
+            },
+            resultsSummary: data.analysis?.answer ? 
+              `Found ${data.relevant_items?.length || 0} relevant items. ${data.analysis.answer.substring(0, 100)}...` :
+              `Search completed with ${data.relevant_items?.length || 0} results`
+          })
+        });
+        console.log('📝 Semantic search query saved to history');
+      } catch (historyError) {
+        console.warn('Failed to save semantic search query to history:', historyError);
+        // Don't fail the main operation if history saving fails
+      }
     } catch (error) {
       console.error('Error searching:', error);
       enqueueSnackbar(`Search failed: ${error.message}`, { variant: 'error' });

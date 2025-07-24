@@ -8,6 +8,7 @@ import { DedupService } from './dedup/dedupService.js';
 import { connectToMongoDB, getConnectionStatus } from './models/database.js';
 import Webset from './models/Webset.js';
 import Item from './models/Item.js';
+import QueryHistory from './models/QueryHistory.js';
 
 dotenv.config();
 
@@ -85,9 +86,19 @@ app.post('/api/websets', async (req, res) => {
             id: webset.id,
             status: 'processing',
             items: [],
+            processedItems: 0, // Track items actually sent to frontend
+            rejectedItems: 0,  // Track items rejected by dedup
             clients: new Map(),
             nextCursor: null, // Track cursor for pagination
-            dedup: dedupEnabled ? new DedupService((wid, msg) => broadcastToClients(wid, msg), entity) : null
+            dedup: dedupEnabled ? new DedupService((wid, msg) => {
+                // Count items as they're broadcast to frontend
+                if (msg.type === 'item') {
+                    activeWebsets.get(wid).processedItems++;
+                } else if (msg.type === 'rejected') {
+                    activeWebsets.get(wid).rejectedItems++;
+                }
+                broadcastToClients(wid, msg);
+            }, entity) : null
         });
 
         res.json({ websetId: webset.id });
@@ -188,7 +199,7 @@ async function pollWebsetResults(websetId) {
         broadcastToClients(websetId, { 
             type: 'finished', 
             status: 'idle',
-            totalItems: websetData.items.length
+            totalItems: websetData.processedItems + websetData.rejectedItems
         });
 
     } catch (error) {
@@ -223,9 +234,19 @@ async function fetchAllItemsWithCursor(websetId, websetData) {
             const itemsResponse = await exa.websets.items.list(websetId, options);
             
             if (itemsResponse.data && itemsResponse.data.length > 0) {
+                const allItemIds = itemsResponse.data.map(item => item.id);
+                const existingIds = websetData.items.map(item => item.id);
+                const duplicateIds = allItemIds.filter(id => existingIds.includes(id));
+                
+                if (duplicateIds.length > 0) {
+                    console.log(`📊 SERVER: Found ${duplicateIds.length} duplicate items from API:`, duplicateIds.slice(0, 3));
+                }
+                
                 const newItems = itemsResponse.data.filter(item => 
                     !websetData.items.some(existing => existing.id === item.id)
                 );
+
+                console.log(`📊 SERVER: API returned ${itemsResponse.data.length} items, ${newItems.length} are new, ${duplicateIds.length} duplicates filtered`);
 
                 if (newItems.length > 0) {
                     // Update status to show we're processing items
@@ -242,10 +263,16 @@ async function fetchAllItemsWithCursor(websetId, websetData) {
                         
                         if (dedup) {
                             // Dedup service handles its own broadcasting via callback
-                            const dedupStart = Date.now();
-                            await dedup.ingest(websetId, item);
+                            try {
+                                await dedup.ingest(websetId, item);
+                            } catch (error) {
+                                console.error(`Error processing item ${item.id} through dedup:`, error);
+                                // If dedup fails, broadcast the item directly to avoid losing it
+                                broadcastToClients(websetId, { type: 'item', item });
+                            }
                         } else {
-                            // No dedup - broadcast directly
+                            // No dedup - broadcast directly and count
+                            websetData.processedItems++;
                             broadcastToClients(websetId, { type: 'item', item });
                         }
                     }
@@ -451,6 +478,142 @@ app.get('/api/semantic/collections', async (req, res) => {
     } catch (error) {
         console.error('Error proxying to semantic service:', error);
         res.status(500).json({ error: error.message });
+    }
+});
+
+// Query History Routes
+app.post('/api/query-history', async (req, res) => {
+    try {
+        const {
+            websetId,
+            queryType,
+            queryText,
+            entityType,
+            resultsMetadata,
+            resultsSummary,
+            sessionId
+        } = req.body;
+
+        // Validation
+        if (!websetId || !queryType || !queryText) {
+            return res.status(400).json({
+                error: 'Missing required fields: websetId, queryType, queryText'
+            });
+        }
+
+        if (!['clustering', 'semantic_search'].includes(queryType)) {
+            return res.status(400).json({
+                error: 'Invalid queryType. Must be "clustering" or "semantic_search"'
+            });
+        }
+
+        // Create query history record
+        const queryHistory = new QueryHistory({
+            websetId,
+            queryType,
+            queryText: queryText.trim(),
+            entityType: entityType || 'unknown',
+            resultsMetadata: resultsMetadata || {},
+            resultsSummary: resultsSummary || '',
+            sessionId: sessionId || null,
+            userAgent: req.get('User-Agent'),
+            ipAddress: req.ip || req.connection.remoteAddress
+        });
+
+        const savedQuery = await queryHistory.save();
+        console.log(`📝 Query history saved: ${queryType} - "${queryText}" for webset ${websetId}`);
+
+        res.status(201).json({
+            success: true,
+            queryId: savedQuery.queryId,
+            message: 'Query saved to history'
+        });
+
+    } catch (error) {
+        console.error('Error saving query history:', error);
+        res.status(500).json({
+            error: 'Failed to save query history',
+            details: error.message
+        });
+    }
+});
+
+app.get('/api/query-history', async (req, res) => {
+    try {
+        const { websetId, queryType, limit = 20 } = req.query;
+        const limitNum = Math.min(parseInt(limit) || 20, 100); // Cap at 100
+
+        let query = {};
+        if (websetId) query.websetId = websetId;
+        if (queryType) query.queryType = queryType;
+
+        const queries = await QueryHistory.find(query)
+            .sort({ createdAt: -1 })
+            .limit(limitNum)
+            .select('queryId websetId queryType queryText entityType resultsMetadata status resultsSummary createdAt');
+
+        res.json({
+            success: true,
+            queries,
+            total: queries.length,
+            filters: { websetId, queryType, limit: limitNum }
+        });
+
+    } catch (error) {
+        console.error('Error fetching query history:', error);
+        res.status(500).json({
+            error: 'Failed to fetch query history',
+            details: error.message
+        });
+    }
+});
+
+app.get('/api/query-history/stats', async (req, res) => {
+    try {
+        const { websetId } = req.query;
+
+        const stats = await QueryHistory.getQueryStats(websetId);
+        const topQueries = await QueryHistory.getTopQueries(null, 5);
+
+        // Calculate overall statistics
+        const overallStats = await QueryHistory.aggregate([
+            ...(websetId ? [{ $match: { websetId } }] : []),
+            {
+                $group: {
+                    _id: null,
+                    totalQueries: { $sum: 1 },
+                    avgProcessingTime: { $avg: '$resultsMetadata.processingTimeMs' },
+                    successRate: {
+                        $avg: { $cond: [{ $eq: ['$status', 'success'] }, 1, 0] }
+                    },
+                    totalItemsProcessed: { $sum: '$resultsMetadata.itemsProcessed' },
+                    totalClustersFound: { $sum: '$resultsMetadata.clustersFound' }
+                }
+            }
+        ]);
+
+        res.json({
+            success: true,
+            stats: {
+                byType: stats,
+                overall: overallStats[0] || {
+                    totalQueries: 0,
+                    avgProcessingTime: 0,
+                    successRate: 0,
+                    totalItemsProcessed: 0,
+                    totalClustersFound: 0
+                },
+                topQueries
+            },
+            websetId
+        });
+
+    } catch (error) {
+        console.error('Error fetching query stats:', error);
+        res.status(500).json({
+            error: 'Failed to fetch query statistics',
+            details: error.message
+        });
     }
 });
 

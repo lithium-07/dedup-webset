@@ -9,6 +9,11 @@ import signal
 import sys
 import atexit
 
+# Set environment variables to prevent multiprocessing issues
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+
 # Configure detailed logging
 logging.basicConfig(
     level=logging.INFO,
@@ -38,14 +43,22 @@ try:
     
     logger.info("🤖 Loading sentence transformer model...")
     # Configure sentence transformer to use fewer processes and clean up properly
+    # (Environment variables set at top to prevent multiprocessing leaks)
+    
     model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
     
+    # Disable multiprocessing in the model to prevent semaphore leaks
+    if hasattr(model, '_target_device'):
+        model._target_device = None
+    if hasattr(model, 'pool'):
+        model.pool = None
+    
     # Test the model with a simple encoding
-    test_vec = model.encode("test", normalize_embeddings=True)
+    test_vec = model.encode("test", normalize_embeddings=True, show_progress_bar=False, batch_size=1)
     if test_vec.shape[0] != DIM:
         raise ValueError(f"Model output dimension {test_vec.shape[0]} doesn't match expected {DIM}")
     
-    logger.info("✅ Sentence transformer model loaded and tested successfully")
+    logger.info("✅ Sentence transformer model loaded and tested successfully (multiprocessing disabled)")
     
 except Exception as e:
     logger.error(f"❌ Initialization failed: {e}")
@@ -61,15 +74,47 @@ def cleanup_resources():
         
         # Force cleanup of sentence transformer resources
         if 'model' in globals():
-            # Clear the model's cache and close any open processes
             try:
+                # Close any multiprocessing pools that might exist
+                if hasattr(model, 'pool') and model.pool is not None:
+                    logger.info("🔧 Closing multiprocessing pool...")
+                    model.pool.close()
+                    model.pool.join()
+                    model.pool = None
+                
+                # Clear the model's cache and close any open processes
                 if hasattr(model, '_modules'):
                     for module in model._modules.values():
                         if hasattr(module, 'cpu'):
                             module.cpu()
+                
+                # Clear tokenizer resources
+                if hasattr(model, '_first_module') and hasattr(model._first_module, 'tokenizer'):
+                    tokenizer = model._first_module.tokenizer
+                    if hasattr(tokenizer, 'backend_tokenizer'):
+                        tokenizer.backend_tokenizer = None
+                
                 logger.info("✅ Model resources cleaned up")
             except Exception as e:
                 logger.warning(f"⚠️ Model cleanup warning: {e}")
+        
+        # Force cleanup of any remaining multiprocessing resources
+        try:
+            import multiprocessing
+            # Clean up any active processes
+            for p in multiprocessing.active_children():
+                logger.info(f"🔧 Terminating child process: {p.pid}")
+                p.terminate()
+                p.join(timeout=1)
+                if p.is_alive():
+                    p.kill()
+            
+            # Clear multiprocessing cache
+            if hasattr(multiprocessing, '_cleanup'):
+                multiprocessing._cleanup()
+                
+        except Exception as e:
+            logger.warning(f"⚠️ Multiprocessing cleanup warning: {e}")
         
         # Clear global variables
         globals().pop('model', None)
@@ -136,7 +181,7 @@ def health_check():
         index_size = index.ntotal
         
         # Test if model is accessible
-        test_vec = model.encode("health check", normalize_embeddings=True)
+        test_vec = model.encode("health check", normalize_embeddings=True, show_progress_bar=False, batch_size=1)
         
         return {
             "status": "healthy",
@@ -198,7 +243,8 @@ def add(req: AddReq):
             return {"ok": False, "error": f"ID {req.row_id} already exists in index"}
         
         logger.info("🔢 Encoding text to vector...")
-        vec = model.encode(req.text, normalize_embeddings=True)
+        # Use single-threaded encoding to prevent multiprocessing semaphore leaks
+        vec = model.encode(req.text, normalize_embeddings=True, show_progress_bar=False, batch_size=1)
         logger.info(f"✅ Text encoded to vector shape: {vec.shape}")
         
         # Validate vector shape
@@ -254,7 +300,8 @@ def query(req: QueryReq):
             return {"ids": [], "total_items": 0}
         
         logger.info(f"🔢 Encoding query text... (index has {index.ntotal} items)")
-        vec = model.encode(req.text, normalize_embeddings=True)
+        # Use single-threaded encoding to prevent multiprocessing semaphore leaks
+        vec = model.encode(req.text, normalize_embeddings=True, show_progress_bar=False, batch_size=1)
         logger.info(f"✅ Query encoded to vector shape: {vec.shape}")
         
         # Validate vector shape
@@ -312,7 +359,9 @@ if __name__ == "__main__":
             host="0.0.0.0", 
             port=port,
             log_level="info",
-            access_log=True
+            access_log=True,
+            # Disable uvicorn's own multiprocessing to prevent semaphore leaks
+            workers=1
         )
     except KeyboardInterrupt:
         logger.info("🛑 Server stopped by user")
